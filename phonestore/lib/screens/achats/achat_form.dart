@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../../models/achat.dart';
 import '../../models/category.dart';
+import '../../models/marque.dart';
 import '../../models/product.dart';
 import '../../models/product_type.dart';
 import '../../services/supabase_service.dart';
@@ -16,21 +17,35 @@ class AchatForm extends StatefulWidget {
 }
 
 class _CartLine {
-  final Product product;
+  /// Null for a 'repair' combo line — those have no product, only a
+  /// category + a bundle of selected types (see [categoryId]/[repairTypeIds]).
+  final Product? product;
   int quantity;
   int unitPrice;
   final int? type2Id;
   final String? type2Name;
   final double? volumeLiters;
+
+  // Repair-combo-only fields.
+  final int? categoryId;
+  final List<int> repairTypeIds;
+  final String? repairLabel; // e.g. "Afficheur + Flash + Connecteur"
+
   _CartLine({
-    required this.product,
+    this.product,
     this.quantity = 1,
     int? unitPrice,
     this.type2Id,
     this.type2Name,
     this.volumeLiters,
-  }) : unitPrice = unitPrice ?? product.prix;
+    this.categoryId,
+    this.repairTypeIds = const [],
+    this.repairLabel,
+  }) : unitPrice = unitPrice ?? product?.prix ?? 0;
+
   int get subtotal => unitPrice * quantity;
+  bool get isRepair => product == null;
+  String get label => isRepair ? (repairLabel ?? '') : product!.displayLabel;
 }
 
 class _AchatFormState extends State<AchatForm> {
@@ -39,12 +54,19 @@ class _AchatFormState extends State<AchatForm> {
   List<Category> _categories = [];
   List<ProductType> _type1Options = [];
   List<ProductType> _type2Options = [];
+  List<Marque> _marques = [];
 
   int? _filterCategoryId;
   int? _filterType1Id;
   int? _filterType2Id;
+  int? _filterMarqueId;
 
-  final Map<String, _CartLine> _cart = {}; // "productId" or "productId_type2Id" -> line
+  // 'repair' mode: flat list of types for the selected category, and which
+  // of them are currently checked to be added as one combo line.
+  List<ProductType> _repairTypeOptions = [];
+  final Set<int> _selectedRepairTypeIds = {};
+
+  final Map<String, _CartLine> _cart = {}; // "productId" or "productId_type2Id" or "repair_..." -> line
   bool _loading = true;
   bool _saving = false;
   String _search = '';
@@ -53,7 +75,16 @@ class _AchatFormState extends State<AchatForm> {
 
   String _cartKey(int productId, int? type2Id) => type2Id == null ? '$productId' : '${productId}_$type2Id';
 
-  List<_CartLine> _linesFor(int productId) => _cart.values.where((l) => l.product.id == productId).toList();
+  /// Deterministic key for a repair combo line — same set of types under the
+  /// same category always maps to the same cart line, regardless of the
+  /// order they were tapped in, so re-adding the same combo increments
+  /// quantity instead of creating a duplicate line.
+  String _repairKey(int categoryId, List<int> typeIds) {
+    final sorted = [...typeIds]..sort();
+    return 'repair_${categoryId}_${sorted.join('-')}';
+  }
+
+  List<_CartLine> _linesFor(int productId) => _cart.values.where((l) => l.product?.id == productId).toList();
 
   int _totalQtyFor(int productId) => _linesFor(productId).fold(0, (s, l) => s + l.quantity);
 
@@ -76,13 +107,25 @@ class _AchatFormState extends State<AchatForm> {
   Future<void> _init() async {
     _allProducts = await _service.getProducts();
     _categories = await _service.getCategories();
+    _marques = await _service.getMarques();
     if (widget.achat != null) {
       for (final item in widget.achat!.items) {
+        if (item.isRepair) {
+          final key = _repairKey(item.categoryId!, item.typeIds);
+          _cart[key] = _CartLine(
+            categoryId: item.categoryId,
+            repairTypeIds: item.typeIds,
+            repairLabel: item.label,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice,
+          );
+          continue;
+        }
         final product = _allProducts.firstWhere(
           (p) => p.id == item.productId,
           orElse: () => item.product!,
         );
-        final key = _cartKey(item.productId, item.type2Id);
+        final key = _cartKey(item.productId!, item.type2Id);
         _cart[key] = _CartLine(
           product: product,
           quantity: item.quantity,
@@ -100,20 +143,30 @@ class _AchatFormState extends State<AchatForm> {
       _filterCategoryId = id;
       _filterType1Id = null;
       _filterType2Id = null;
+      _filterMarqueId = null;
       _type2Options = [];
+      _repairTypeOptions = [];
+      _selectedRepairTypeIds.clear();
     });
     if (id == null) {
       _type1Options = [];
       setState(() {});
       return;
     }
-    _type1Options = await _service.getTypes(categoryId: id, topLevelOnly: true, level: 1);
+    final c = _categories.firstWhere((c) => c.id == id);
+    if (c.mode == CategoryMode.repair) {
+      _type1Options = [];
+      _repairTypeOptions = await _service.getTypes(categoryId: id, topLevelOnly: true, level: 1);
+    } else if (c.mode != CategoryMode.perfume) {
+      _type1Options = await _service.getTypes(categoryId: id, topLevelOnly: true, level: 1);
+    } else {
+      _type1Options = [];
+    }
     setState(() {});
   }
 
   Future<void> _onType1FilterChanged(int? id) async {
     setState(() => _filterType1Id = id);
-    if (_filterCategoryMode == CategoryMode.perfume) return; // tailles aren't a product attribute here
     setState(() => _filterType2Id = null);
     _type2Options = id == null ? [] : await _service.getTypes(parentId: id);
     setState(() {});
@@ -124,7 +177,7 @@ class _AchatFormState extends State<AchatForm> {
   /// For "simple" categories (Flexy, Reparation) there's no fixed catalog
   /// price — the worker types the actual sale price in on the spot.
   Future<int?> _askPrice(Product p, {int? initial}) async {
-    final ctrl = TextEditingController(text: (initial ?? p.prix).toString());
+    final ctrl = TextEditingController(text: (initial ?? p.prix ?? 0).toString());
     return showDialog<int>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -170,8 +223,8 @@ class _AchatFormState extends State<AchatForm> {
   }
 
   /// Perfume purchases: pick which bottle size was sold, then add/increment
-  /// that specific product+size line. Price stays the product's fixed
-  /// price — only the size (and the liters it represents for stock) varies.
+  /// that specific product+size line. The price comes from the taille
+  /// itself — bottle size and price are bundled together in the catalogue.
   Future<void> _addPerfumeLine(Product p) async {
     final tailles = await _service.getTypes(categoryId: p.categoryId, topLevelOnly: true, level: 2);
     if (tailles.isEmpty) {
@@ -192,7 +245,10 @@ class _AchatFormState extends State<AchatForm> {
             spacing: 8,
             runSpacing: 8,
             children: tailles
-                .map((t) => ActionChip(label: Text(t.volumeLabel), onPressed: () => Navigator.pop(ctx, t)))
+                .map((t) => ActionChip(
+                      label: Text('${t.volumeLabel} — ${t.priceLabel ?? "prix non défini"}'),
+                      onPressed: () => Navigator.pop(ctx, t),
+                    ))
                 .toList(),
           ),
         ),
@@ -207,13 +263,79 @@ class _AchatFormState extends State<AchatForm> {
       } else {
         _cart[key] = _CartLine(
           product: p,
-          unitPrice: p.prix,
+          unitPrice: chosen.prix ?? 0,
           type2Id: chosen.id,
           type2Name: chosen.name,
           volumeLiters: chosen.volumeLiters,
         );
       }
     });
+  }
+
+  /// Same free-price dialog as [_askPrice], but titled after the combo of
+  /// selected types (e.g. "Afficheur + Flash + Connecteur") since there's
+  /// no product to name it after.
+  Future<int?> _askRepairPrice(String label, {int? initial}) async {
+    final ctrl = TextEditingController(text: (initial ?? 0).toString());
+    return showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Prix — $label'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(labelText: 'Prix total (DA) *'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+          ElevatedButton(
+            onPressed: () {
+              final v = int.tryParse(ctrl.text.trim());
+              if (v == null || v < 0) return;
+              Navigator.pop(ctx, v);
+            },
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Adds the currently checked repair types as one combo line. If the exact
+  /// same combo (same category + same set of types) is already in the cart,
+  /// this increments its quantity instead of asking for a price again.
+  Future<void> _addRepairCombo() async {
+    if (_filterCategoryId == null || _selectedRepairTypeIds.isEmpty) return;
+    final types = _repairTypeOptions.where((t) => _selectedRepairTypeIds.contains(t.id)).toList();
+    final ids = types.map((t) => t.id).toList();
+    final key = _repairKey(_filterCategoryId!, ids);
+    if (_cart.containsKey(key)) {
+      setState(() {
+        _cart[key]!.quantity++;
+        _selectedRepairTypeIds.clear();
+      });
+      return;
+    }
+    final label = types.map((t) => t.name).join(' + ');
+    final price = await _askRepairPrice(label);
+    if (price == null) return;
+    setState(() {
+      _cart[key] = _CartLine(
+        categoryId: _filterCategoryId,
+        repairTypeIds: ids,
+        repairLabel: label,
+        unitPrice: price,
+      );
+      _selectedRepairTypeIds.clear();
+    });
+  }
+
+  Future<void> _editRepairPrice(String key) async {
+    final line = _cart[key];
+    if (line == null) return;
+    final price = await _askRepairPrice(line.label, initial: line.unitPrice);
+    if (price != null) setState(() => line.unitPrice = price);
   }
 
   Future<void> _editPrice(Product p) async {
@@ -245,14 +367,23 @@ class _AchatFormState extends State<AchatForm> {
     }
     setState(() => _saving = true);
     try {
-      final items = _cart.values
-          .map((l) => AchatItem(
-                productId: l.product.id,
-                quantity: l.quantity,
-                unitPrice: l.unitPrice,
-                type2Id: l.type2Id,
-              ))
-          .toList();
+      final items = _cart.values.map((l) {
+        if (l.isRepair) {
+          return AchatItem(
+            categoryId: l.categoryId,
+            label: l.repairLabel,
+            typeIds: l.repairTypeIds,
+            quantity: l.quantity,
+            unitPrice: l.unitPrice,
+          );
+        }
+        return AchatItem(
+          productId: l.product!.id,
+          quantity: l.quantity,
+          unitPrice: l.unitPrice,
+          type2Id: l.type2Id,
+        );
+      }).toList();
 
       if (_isEdit) {
         await _service.updateAchatItems(achatId: widget.achat!.id!, items: items);
@@ -268,9 +399,11 @@ class _AchatFormState extends State<AchatForm> {
   List<Product> get _filtered {
     var list = _allProducts;
     if (_filterCategoryId != null) list = list.where((p) => p.categoryId == _filterCategoryId).toList();
-    if (_filterType1Id != null) list = list.where((p) => p.type1Id == _filterType1Id).toList();
-    if (_filterType2Id != null && _filterCategoryMode != CategoryMode.perfume) {
-      list = list.where((p) => p.type2Id == _filterType2Id).toList();
+    if (_filterCategoryMode == CategoryMode.perfume) {
+      if (_filterMarqueId != null) list = list.where((p) => p.marqueId == _filterMarqueId).toList();
+    } else {
+      if (_filterType1Id != null) list = list.where((p) => p.type1Id == _filterType1Id).toList();
+      if (_filterType2Id != null) list = list.where((p) => p.type2Id == _filterType2Id).toList();
     }
     if (_search.isNotEmpty) {
       final q = _search.toLowerCase();
@@ -292,19 +425,22 @@ class _AchatFormState extends State<AchatForm> {
       body: Column(
         children: [
           _buildFilterBar(),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-            child: TextField(
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.search, color: AppColors.grey),
-                hintText: 'Chercher par référence, type, marque...',
-                isDense: true,
+          if (_filterCategoryMode != CategoryMode.repair)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              child: TextField(
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search, color: AppColors.grey),
+                  hintText: 'Chercher par référence, type, marque...',
+                  isDense: true,
+                ),
+                onChanged: (v) => setState(() => _search = v),
               ),
-              onChanged: (v) => setState(() => _search = v),
             ),
-          ),
           Expanded(
-            child: filtered.isEmpty
+            child: _filterCategoryMode == CategoryMode.repair
+                ? _buildRepairPicker()
+                : filtered.isEmpty
                 ? const Center(child: Text('Aucun produit trouvé', style: TextStyle(color: AppColors.grey)))
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -334,10 +470,10 @@ class _AchatFormState extends State<AchatForm> {
                               title: Text(p.displayLabel, maxLines: 1, overflow: TextOverflow.ellipsis),
                               subtitle: Text(
                                 isSimple
-                                    ? '${p.reference} · prix libre'
+                                    ? '${p.reference} · prix libre${p.stock != null ? " · stock: ${p.stockLabel}" : ""}'
                                     : isPerfume
-                                        ? '${p.reference} · ${p.prix} DA · stock: ${p.stockLabel}'
-                                        : '${p.reference} · ${p.prix} DA · stock: ${p.stock.toInt()}',
+                                        ? '${p.reference} · stock: ${p.stockLabel}'
+                                        : '${p.reference} · ${p.prix} DA · stock: ${p.stockLabel}',
                                 style: const TextStyle(color: AppColors.grey, fontSize: 12),
                               ),
                               trailing: isPerfume
@@ -410,8 +546,104 @@ class _AchatFormState extends State<AchatForm> {
     );
   }
 
+  /// 'repair' mode body: tap several types to build a combo (e.g. Afficheur
+  /// + Flash + Connecteur), then add it as one line with a single price the
+  /// worker types in. Already-added combos for this category show below
+  /// with the usual quantity/price/remove controls.
+  Widget _buildRepairPicker() {
+    final comboLines = _cart.values.where((l) => l.isRepair && l.categoryId == _filterCategoryId).toList();
+    final selectedLabel = _repairTypeOptions
+        .where((t) => _selectedRepairTypeIds.contains(t.id))
+        .map((t) => t.name)
+        .join(' + ');
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      children: [
+        if (_repairTypeOptions.isEmpty)
+          const Padding(
+            padding: EdgeInsets.only(top: 24),
+            child: Center(
+              child: Text('Aucun type pour cette catégorie — ajoutez-en dans le Catalogue.',
+                  style: TextStyle(color: AppColors.grey)),
+            ),
+          )
+        else ...[
+          const Text('Éléments de la réparation', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+          const SizedBox(height: 4),
+          const Text('Sélectionnez un ou plusieurs éléments, puis ajoutez-les avec un prix total.',
+              style: TextStyle(color: AppColors.grey, fontSize: 12)),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: _repairTypeOptions.map((t) {
+              final selected = _selectedRepairTypeIds.contains(t.id);
+              return FilterChip(
+                label: Text(t.name),
+                selected: selected,
+                selectedColor: AppColors.gold,
+                onSelected: (_) => setState(() {
+                  if (selected) {
+                    _selectedRepairTypeIds.remove(t.id);
+                  } else {
+                    _selectedRepairTypeIds.add(t.id);
+                  }
+                }),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _selectedRepairTypeIds.isEmpty ? null : _addRepairCombo,
+              icon: const Icon(Icons.add),
+              label: Text(selectedLabel.isEmpty ? 'Sélectionnez au moins un élément' : 'Ajouter : $selectedLabel'),
+            ),
+          ),
+        ],
+        if (comboLines.isNotEmpty) ...[
+          const SizedBox(height: 24),
+          const Text('Réparations ajoutées', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+          const SizedBox(height: 8),
+          ...comboLines.map((l) {
+            final key = _repairKey(l.categoryId!, l.repairTypeIds);
+            return Card(
+              margin: const EdgeInsets.only(bottom: 8),
+              child: ListTile(
+                title: Text(l.label),
+                subtitle: Text('${l.unitPrice} DA × ${l.quantity} = ${l.subtotal} DA',
+                    style: const TextStyle(color: AppColors.grey, fontSize: 12)),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.edit_outlined, size: 20, color: AppColors.grey),
+                      onPressed: () => _editRepairPrice(key),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.remove_circle_outline, color: AppColors.black),
+                      onPressed: () => _decrementLine(key),
+                    ),
+                    Text('${l.quantity}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    IconButton(
+                      icon: const Icon(Icons.add_circle, color: AppColors.gold),
+                      onPressed: () => setState(() => l.quantity++),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }),
+        ],
+      ],
+    );
+  }
+
   Widget _buildFilterBar() {
     final perfume = _filterCategoryMode == CategoryMode.perfume;
+    final repair = _filterCategoryMode == CategoryMode.repair;
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
       child: Column(
@@ -423,20 +655,33 @@ class _AchatFormState extends State<AchatForm> {
             onSelect: _onCategoryFilterChanged,
             allowClear: true,
           ),
-          if (_filterCategoryId != null) ...[
+          // 'repair' categories pick their types directly in the combo
+          // picker below, not as a filter here.
+          if (_filterCategoryId != null && !repair) ...[
             const SizedBox(height: 12),
-            TypeChipSelector(
-              label: perfume ? 'Nom du parfum' : 'Type',
-              items: _type1Options,
-              selectedId: _filterType1Id,
-              onSelect: _onType1FilterChanged,
-              allowClear: true,
-            ),
+            if (perfume)
+              DropdownButtonFormField<int>(
+                value: _filterMarqueId,
+                decoration: const InputDecoration(labelText: 'Marque'),
+                items: [
+                  const DropdownMenuItem<int>(value: null, child: Text('Toutes les marques')),
+                  ..._marques.map((m) => DropdownMenuItem(value: m.id, child: Text(m.name))),
+                ],
+                onChanged: (v) => setState(() => _filterMarqueId = v),
+              )
+            else
+              TypeChipSelector(
+                label: 'Type',
+                items: _type1Options,
+                selectedId: _filterType1Id,
+                onSelect: _onType1FilterChanged,
+                allowClear: true,
+              ),
           ],
-          if (_type2Options.isNotEmpty) ...[
+          if (!perfume && !repair && _type2Options.isNotEmpty) ...[
             const SizedBox(height: 12),
             TypeChipSelector(
-              label: perfume ? 'Taille' : 'Sous-type',
+              label: 'Sous-type',
               items: _type2Options,
               selectedId: _filterType2Id,
               onSelect: (v) => setState(() => _filterType2Id = v),

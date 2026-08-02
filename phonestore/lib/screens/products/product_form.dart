@@ -74,6 +74,8 @@ class _ProductFormState extends State<ProductForm> {
         return 'Nom du parfum *';
       case CategoryMode.simple:
         return 'Type *';
+      case CategoryMode.repair:
+        return 'Type *';
       case CategoryMode.hierarchical:
         return 'Type *';
     }
@@ -81,12 +83,32 @@ class _ProductFormState extends State<ProductForm> {
 
   String get _type2Label => _categoryMode == CategoryMode.perfume ? 'Taille (ex: 100ml)' : 'Sous-type (optionnel)';
 
-  // Perfume products only ever pick a parfum name (type1) — bottle size is
-  // chosen later, per purchase, in the Achats form. Simple products also
-  // have no type2. Only hierarchical categories show a sous-type field.
+  // Perfume products no longer have a type1/type2 at all — they're
+  // identified purely by their marque. Bottle size (taille) and its price
+  // are chosen later, per purchase, in the Achats form. Simple products
+  // have no type2. Only hierarchical categories show type1/sous-type.
+  bool get _showType1 => _categoryMode != CategoryMode.perfume;
   bool get _showType2 => _categoryMode == CategoryMode.hierarchical;
-  bool get _showStock => _categoryMode != CategoryMode.simple;
-  String get _stockLabel => _categoryMode == CategoryMode.perfume ? 'Stock (L)' : 'Stock';
+  bool get _showPrix => _categoryMode != CategoryMode.perfume;
+  bool get _showStock => true;
+  String get _stockLabel {
+    switch (_categoryMode) {
+      case CategoryMode.perfume:
+        return 'Stock (L)';
+      case CategoryMode.simple:
+        return 'Stock (optionnel)';
+      case CategoryMode.repair:
+        return 'Stock (optionnel)';
+      case CategoryMode.hierarchical:
+        return 'Stock';
+    }
+  }
+
+  // A product's marque must match its category's "side": perfume
+  // categories only ever offer perfum marques, everything else only ever
+  // offers tech marques — the two lists never mix.
+  MarqueType get _desiredMarqueType => _categoryMode == CategoryMode.perfume ? MarqueType.perfum : MarqueType.tech;
+  List<Marque> get _marqueOptions => _marques.where((m) => m.type == _desiredMarqueType).toList();
 
   @override
   void initState() {
@@ -102,17 +124,19 @@ class _ProductFormState extends State<ProductForm> {
     if (p != null) {
       _referenceCtrl.text = p.reference;
       _nameCtrl.text = p.name ?? '';
-      _prixCtrl.text = p.prix.toString();
-      _stockCtrl.text = p.stock % 1 == 0 ? p.stock.toInt().toString() : p.stock.toString();
+      _prixCtrl.text = p.prix?.toString() ?? '';
+      _stockCtrl.text = p.stock == null ? '' : (p.stock! % 1 == 0 ? p.stock!.toInt().toString() : p.stock!.toString());
       _existingImageUrl = p.imageUrl;
       _categoryId = p.categoryId;
       _type1Id = p.type1Id;
       _type2Id = p.type2Id;
       _marqueId = p.marqueId;
 
-      _type1Options = await _service.getTypes(categoryId: _categoryId, topLevelOnly: true, level: 1);
-      if (_type1Id != null && _showType2) {
-        _type2Options = await _service.getTypes(parentId: _type1Id);
+      if (_showType1) {
+        _type1Options = await _service.getTypes(categoryId: _categoryId, topLevelOnly: true, level: 1);
+        if (_type1Id != null && _showType2) {
+          _type2Options = await _service.getTypes(parentId: _type1Id);
+        }
       }
     }
     setState(() => _loading = false);
@@ -124,9 +148,16 @@ class _ProductFormState extends State<ProductForm> {
       _categoryId = id;
       _type1Id = null;
       _type2Id = null;
+      _type1Options = [];
       _type2Options = [];
+      final selected = _marques.where((m) => m.id == _marqueId);
+      if (selected.isNotEmpty && selected.first.type != _desiredMarqueType) {
+        _marqueId = null;
+      }
     });
-    _type1Options = await _service.getTypes(categoryId: id, topLevelOnly: true, level: 1);
+    if (_showType1) {
+      _type1Options = await _service.getTypes(categoryId: id, topLevelOnly: true, level: 1);
+    }
     setState(() {});
   }
 
@@ -144,7 +175,14 @@ class _ProductFormState extends State<ProductForm> {
   /// and the field is still empty — the admin can freely overwrite it. Never
   /// touches an existing product's reference.
   void _maybeSuggestReference() {
-    if (_isEdit || _referenceCtrl.text.trim().isNotEmpty || _type1Id == null) return;
+    if (_isEdit || _referenceCtrl.text.trim().isNotEmpty) return;
+    if (_categoryMode == CategoryMode.perfume) {
+      if (_marqueId == null) return;
+      final m = _marques.where((m) => m.id == _marqueId);
+      _referenceCtrl.text = _generateReference(m.isEmpty ? 'PRF' : m.first.name);
+      return;
+    }
+    if (_type1Id == null) return;
     final t1 = _type1Options.where((t) => t.id == _type1Id);
     final label = t1.isEmpty ? 'PRD' : t1.first.name;
     _referenceCtrl.text = _generateReference(label);
@@ -208,9 +246,10 @@ class _ProductFormState extends State<ProductForm> {
   Future<void> _quickAddMarque() async {
     final name = await _showNameOnlyDialog(title: 'Nouvelle marque');
     if (name == null) return;
-    final id = await _service.upsertMarque(name: name);
+    final id = await _service.upsertMarque(name: name, type: _desiredMarqueType);
     _marques = await _service.getMarques();
     setState(() => _marqueId = id);
+    _maybeSuggestReference();
   }
 
   Future<_CategoryDialogResult?> _showCategoryDialog() async {
@@ -394,13 +433,29 @@ class _ProductFormState extends State<ProductForm> {
     );
   }
 
+  /// Stock is genuinely optional only for 'simple' products — leaving the
+  /// field blank there means "not tracked" (null), not zero. Every other
+  /// category still defaults a blank field to 0, as before.
+  double? _parseStock() {
+    final text = _stockCtrl.text.trim().replaceAll(',', '.');
+    if (text.isEmpty) return _categoryMode == CategoryMode.simple ? null : 0;
+    return double.tryParse(text) ?? (_categoryMode == CategoryMode.simple ? null : 0);
+  }
+
   // ---------------- save ----------------
 
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
-    if (_categoryId == null || _type1Id == null) {
+    final isPerfume = _categoryMode == CategoryMode.perfume;
+    if (_categoryId == null || (!isPerfume && _type1Id == null)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Catégorie et type sont obligatoires')),
+      );
+      return;
+    }
+    if (isPerfume && _marqueId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('La marque est obligatoire pour un parfum')),
       );
       return;
     }
@@ -412,11 +467,11 @@ class _ProductFormState extends State<ProductForm> {
         reference: _referenceCtrl.text.trim(),
         name: _nameCtrl.text.trim().isEmpty ? null : _nameCtrl.text.trim(),
         categoryId: _categoryId!,
-        type1Id: _type1Id!,
+        type1Id: isPerfume ? null : _type1Id!,
         type2Id: _showType2 ? _type2Id : null,
         marqueId: _marqueId,
-        prix: int.parse(_prixCtrl.text.trim()),
-        stock: double.tryParse(_stockCtrl.text.trim().replaceAll(',', '.')) ?? 0,
+        prix: isPerfume ? null : int.parse(_prixCtrl.text.trim()),
+        stock: _parseStock(),
         imageUrl: _existingImageUrl,
       );
 
@@ -534,6 +589,11 @@ class _ProductFormState extends State<ProductForm> {
                     icon: const Icon(Icons.refresh, color: AppColors.gold),
                     tooltip: 'Générer une référence',
                     onPressed: () {
+                      if (_categoryMode == CategoryMode.perfume) {
+                        final m = _marques.where((m) => m.id == _marqueId);
+                        setState(() => _referenceCtrl.text = _generateReference(m.isEmpty ? 'PRF' : m.first.name));
+                        return;
+                      }
                       final t1 = _type1Options.where((t) => t.id == _type1Id);
                       setState(() => _referenceCtrl.text = _generateReference(t1.isEmpty ? 'PRD' : t1.first.name));
                     },
@@ -550,19 +610,23 @@ class _ProductFormState extends State<ProductForm> {
             const Text('Catégorie *', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
             const SizedBox(height: 8),
             CategoryIconPicker(
-              categories: _categories,
+              // 'repair' categories never have products — everything is
+              // chosen as a type combo directly in the Achats form.
+              categories: _categories.where((c) => c.mode != CategoryMode.repair).toList(),
               selectedId: _categoryId,
               onSelect: _onCategoryChanged,
               onAddNew: _quickAddCategory,
             ),
-            const SizedBox(height: 20),
-            TypeChipSelector(
-              label: _type1Label,
-              items: _type1Options,
-              selectedId: _type1Id,
-              onSelect: _categoryId == null ? (_) {} : _onType1Changed,
-              onAddNew: _categoryId == null ? null : _quickAddType1,
-            ),
+            if (_showType1) ...[
+              const SizedBox(height: 20),
+              TypeChipSelector(
+                label: _type1Label,
+                items: _type1Options,
+                selectedId: _type1Id,
+                onSelect: _categoryId == null ? (_) {} : _onType1Changed,
+                onAddNew: _categoryId == null ? null : _quickAddType1,
+              ),
+            ],
             if (_showType2) ...[
               const SizedBox(height: 20),
               TypeChipSelector(
@@ -577,34 +641,48 @@ class _ProductFormState extends State<ProductForm> {
             const SizedBox(height: 20),
             _marqueDropdown(),
             const SizedBox(height: 20),
-            Row(
-              children: [
-                Expanded(
-                  child: TextFormField(
-                    controller: _prixCtrl,
-                    decoration: InputDecoration(
-                      labelText: _categoryMode == CategoryMode.simple ? 'Prix par défaut (DA) *' : 'Prix (DA) *',
-                    ),
-                    keyboardType: TextInputType.number,
-                    validator: (v) => (v == null || int.tryParse(v) == null) ? 'Prix invalide' : null,
-                  ),
-                ),
-                if (_showStock) ...[
-                  const SizedBox(width: 12),
+            if (_showPrix)
+              Row(
+                children: [
                   Expanded(
                     child: TextFormField(
-                      controller: _stockCtrl,
-                      decoration: InputDecoration(labelText: _stockLabel),
-                      keyboardType: TextInputType.numberWithOptions(decimal: _categoryMode == CategoryMode.perfume),
+                      controller: _prixCtrl,
+                      decoration: InputDecoration(
+                        labelText: _categoryMode == CategoryMode.simple ? 'Prix par défaut (DA) *' : 'Prix (DA) *',
+                      ),
+                      keyboardType: TextInputType.number,
+                      validator: (v) => (v == null || int.tryParse(v) == null) ? 'Prix invalide' : null,
                     ),
                   ),
+                  if (_showStock) ...[
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextFormField(
+                        controller: _stockCtrl,
+                        decoration: InputDecoration(labelText: _stockLabel),
+                        keyboardType: TextInputType.numberWithOptions(decimal: _categoryMode == CategoryMode.perfume),
+                      ),
+                    ),
+                  ],
                 ],
-              ],
-            ),
+              )
+            else if (_showStock)
+              TextFormField(
+                controller: _stockCtrl,
+                decoration: InputDecoration(labelText: _stockLabel),
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              ),
             if (_categoryMode == CategoryMode.simple) ...[
               const SizedBox(height: 8),
               const Text(
                 'Le prix sera modifiable à chaque vente dans le formulaire Achats.',
+                style: TextStyle(color: AppColors.grey, fontSize: 12),
+              ),
+            ],
+            if (_categoryMode == CategoryMode.perfume) ...[
+              const SizedBox(height: 8),
+              const Text(
+                'Le prix dépend de la taille de bouteille — il se choisit à la vente, dans le formulaire Achats. Ajoutez ou modifiez les tailles depuis le Catalogue.',
                 style: TextStyle(color: AppColors.grey, fontSize: 12),
               ),
             ],
@@ -625,15 +703,20 @@ class _ProductFormState extends State<ProductForm> {
   }
 
   Widget _marqueDropdown() {
+    final required = _categoryMode == CategoryMode.perfume;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Expanded(
           child: DropdownButtonFormField<int>(
             value: _marqueId,
-            decoration: const InputDecoration(labelText: 'Marque (optionnel)'),
-            items: _marques.map((m) => DropdownMenuItem(value: m.id, child: Text(m.name))).toList(),
-            onChanged: (v) => setState(() => _marqueId = v),
+            decoration: InputDecoration(labelText: required ? 'Marque *' : 'Marque (optionnel)'),
+            items: _marqueOptions.map((m) => DropdownMenuItem(value: m.id, child: Text(m.name))).toList(),
+            onChanged: (v) {
+              setState(() => _marqueId = v);
+              _maybeSuggestReference();
+            },
+            validator: required ? (v) => v == null ? 'Requis' : null : null,
           ),
         ),
         const SizedBox(width: 8),

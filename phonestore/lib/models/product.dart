@@ -3,11 +3,20 @@ class Product {
   final String reference;
   final String? name;
   final int categoryId;
-  final int type1Id;
+
+  /// Null for perfume-category products — perfume products are identified
+  /// by their marque alone, not a type1 ("nom du parfum") row anymore.
+  final int? type1Id;
   final int? type2Id;
   final int? marqueId;
-  final int prix;
-  final double stock;
+
+  /// Null for perfume-category products — the price now lives on the
+  /// taille (bottle size) chosen at purchase time, not on the product.
+  final int? prix;
+  /// Null means "not tracked" — only meaningful for 'simple' category
+  /// products, where stock is optional. Hierarchical/perfume products
+  /// always get a numeric value (defaulting to 0) from the form.
+  final double? stock;
   final String? imageUrl;
 
   // Convenience fields populated when the query joins related tables.
@@ -25,11 +34,11 @@ class Product {
     required this.reference,
     this.name,
     required this.categoryId,
-    required this.type1Id,
+    this.type1Id,
     this.type2Id,
     this.marqueId,
-    required this.prix,
-    this.stock = 0,
+    this.prix,
+    this.stock,
     this.imageUrl,
     this.categoryName,
     this.categoryIconKey,
@@ -46,11 +55,11 @@ class Product {
         reference: map['reference'] as String? ?? '',
         name: map['name'] as String?,
         categoryId: map['category_id'] as int,
-        type1Id: map['type1_id'] as int,
+        type1Id: map['type1_id'] as int?,
         type2Id: map['type2_id'] as int?,
         marqueId: map['marque_id'] as int?,
-        prix: map['prix'] as int,
-        stock: (map['stock'] as num?)?.toDouble() ?? 0,
+        prix: map['prix'] as int?,
+        stock: (map['stock'] as num?)?.toDouble(),
         imageUrl: map['image_url'] as String?,
         categoryName: (map['categories'] as Map?)?['name'] as String?,
         categoryIconKey: (map['categories'] as Map?)?['icon_key'] as String?,
@@ -95,9 +104,29 @@ class Product {
 
   bool get isPerfume => categoryMode == 'perfume';
 
+  /// False for perfume products — their price is chosen per taille (bottle
+  /// size) at purchase time rather than fixed on the product.
+  bool get hasFixedPrice => prix != null;
+
+  /// Perfume low-stock threshold: 200ml. Non-perfume threshold: 2 units.
+  static const double lowStockPerfumeLiters = 0.2;
+  static const double lowStockUnits = 2;
+
   /// Perfume stock is a liter volume ("2.5 L"); everything else is a plain
-  /// unit count with no decimals.
-  String get stockLabel => isPerfume
-      ? '${stock % 1 == 0 ? stock.toInt() : stock.toStringAsFixed(2)} L'
-      : stock.toInt().toString();
+  /// unit count with no decimals. "—" when stock isn't tracked at all
+  /// (only possible for 'simple' category products).
+  String get stockLabel {
+    final s = stock;
+    if (s == null) return '—';
+    return isPerfume ? '${s % 1 == 0 ? s.toInt() : s.toStringAsFixed(2)} L' : s.toInt().toString();
+  }
+
+  /// False when stock isn't tracked (null) — a 'simple' product left
+  /// without a stock value is never flagged as low stock. Otherwise
+  /// perfume uses the 200ml threshold, everything else uses 2 units.
+  bool get isLowStock {
+    final s = stock;
+    if (s == null) return false;
+    return s < (isPerfume ? lowStockPerfumeLiters : lowStockUnits);
+  }
 }

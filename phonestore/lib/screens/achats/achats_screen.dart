@@ -91,11 +91,11 @@ class _AchatsScreenState extends State<AchatsScreen> {
       if (_minPrice != null && a.totalPrice < _minPrice!) return false;
       if (_maxPrice != null && a.totalPrice > _maxPrice!) return false;
       if (_categoryId != null) {
-        final matches = a.items.any((it) => it.product?.categoryId == _categoryId);
+        final matches = a.items.any((it) => (it.product?.categoryId ?? it.categoryId) == _categoryId);
         if (!matches) return false;
       }
       if (_type1Id != null) {
-        final matches = a.items.any((it) => it.product?.type1Id == _type1Id);
+        final matches = a.items.any((it) => it.product?.type1Id == _type1Id || it.typeIds.contains(_type1Id));
         if (!matches) return false;
       }
       return true;
@@ -332,7 +332,7 @@ class _AchatCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final itemCount = achat.items.length;
     final firstNames = achat.items
-        .map((it) => it.product?.displayLabel)
+        .map((it) => it.isRepair ? it.label : it.product?.displayLabel)
         .where((e) => e != null && e.isNotEmpty)
         .take(2)
         .join(', ');

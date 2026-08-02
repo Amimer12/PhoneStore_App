@@ -1,8 +1,11 @@
 /// How the app should treat products/achats for this category.
 /// - hierarchical: normal type1 + optional type2, fixed price per product (Electronics)
-/// - simple: type1 only, no fixed price — typed in manually at sale time (Flexy, Reparation)
+/// - simple: type1 only, no fixed price — typed in manually at sale time (Flexy)
 /// - perfume: type1/type2 reused as "Nom du parfum" / "Taille", fixed price per combo (Perfum)
-enum CategoryMode { hierarchical, simple, perfume }
+/// - repair: single level of types, NO products at all — at sale time the
+///   worker picks one or more types (e.g. Afficheur + Flash + Connecteur)
+///   and types in a single total price for the whole combo (Reparation).
+enum CategoryMode { hierarchical, simple, perfume, repair }
 
 CategoryMode categoryModeFromString(String s) {
   switch (s) {
@@ -10,6 +13,8 @@ CategoryMode categoryModeFromString(String s) {
       return CategoryMode.simple;
     case 'perfume':
       return CategoryMode.perfume;
+    case 'repair':
+      return CategoryMode.repair;
     default:
       return CategoryMode.hierarchical;
   }

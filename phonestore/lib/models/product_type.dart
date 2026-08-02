@@ -13,6 +13,12 @@ class ProductType {
   /// parfum: a parallel list, not a hierarchical sous-type.
   final double? volumeLiters;
 
+  /// Bottle price in DA. Only meaningful for a level-2 "taille" row under a
+  /// 'perfume' category — this is now where the perfume price actually
+  /// lives (the product itself no longer carries a fixed price). Null for
+  /// every non-perfume type row.
+  final int? prix;
+
   ProductType({
     required this.id,
     required this.categoryId,
@@ -21,6 +27,7 @@ class ProductType {
     this.imageUrl,
     required this.level,
     this.volumeLiters,
+    this.prix,
   });
 
   factory ProductType.fromMap(Map<String, dynamic> map) => ProductType(
@@ -31,6 +38,7 @@ class ProductType {
         imageUrl: map['image_url'] as String?,
         level: map['level'] as int? ?? 1,
         volumeLiters: (map['volume_liters'] as num?)?.toDouble(),
+        prix: map['prix'] as int?,
       );
 
   Map<String, dynamic> toMap() => {
@@ -40,6 +48,7 @@ class ProductType {
         'image_url': imageUrl,
         'level': level,
         'volume_liters': volumeLiters,
+        'prix': prix,
       };
 
   /// e.g. "100ml" for 0.1L, "1.5L" for 1.5 — used to label taille chips.
@@ -49,4 +58,7 @@ class ProductType {
     if (v < 1) return '${(v * 1000).round()}ml';
     return v % 1 == 0 ? '${v.toInt()}L' : '${v.toStringAsFixed(2)}L';
   }
+
+  /// e.g. "1200 DA" — null when no price was set on this taille yet.
+  String? get priceLabel => prix == null ? null : '$prix DA';
 }

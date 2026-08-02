@@ -11,9 +11,6 @@ import '../../widgets/selector_chips.dart';
 import '../../widgets/app_logo.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-/// Threshold below which a product is flagged as low stock in the list.
-const double kLowStockThreshold = 2;
-
 enum _ProductSort { defaultOrder, priceAsc, priceDesc, stockAsc, stockDesc }
 
 extension on _ProductSort {
@@ -67,6 +64,11 @@ class _ProductsScreenState extends State<ProductsScreen> {
   bool _loading = true;
   String? _error;
 
+  bool get _selectedIsPerfume {
+    final c = _categories.where((c) => c.id == _selectedCategoryId);
+    return c.isNotEmpty && c.first.mode == CategoryMode.perfume;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -80,8 +82,10 @@ class _ProductsScreenState extends State<ProductsScreen> {
     });
     try {
       _categories = await _service.getCategories();
-      if (_selectedCategoryId != null) {
+      if (_selectedCategoryId != null && !_selectedIsPerfume) {
         _type1Options = await _service.getTypes(categoryId: _selectedCategoryId, topLevelOnly: true, level: 1);
+      } else {
+        _type1Options = [];
       }
       _allProducts = await _service.getProducts(
         categoryId: _selectedCategoryId,
@@ -108,16 +112,16 @@ class _ProductsScreenState extends State<ProductsScreen> {
       case _ProductSort.defaultOrder:
         break;
       case _ProductSort.priceAsc:
-        list.sort((a, b) => a.prix.compareTo(b.prix));
+        list.sort((a, b) => (a.prix ?? 0).compareTo(b.prix ?? 0));
         break;
       case _ProductSort.priceDesc:
-        list.sort((a, b) => b.prix.compareTo(a.prix));
+        list.sort((a, b) => (b.prix ?? 0).compareTo(a.prix ?? 0));
         break;
       case _ProductSort.stockAsc:
-        list.sort((a, b) => a.stock.compareTo(b.stock));
+        list.sort((a, b) => (a.stock ?? 0).compareTo(b.stock ?? 0));
         break;
       case _ProductSort.stockDesc:
-        list.sort((a, b) => b.stock.compareTo(a.stock));
+        list.sort((a, b) => (b.stock ?? 0).compareTo(a.stock ?? 0));
         break;
     }
     return list;
@@ -160,8 +164,21 @@ class _ProductsScreenState extends State<ProductsScreen> {
       ),
     );
     if (ok == true) {
-      await _service.deleteProduct(p.id);
-      _load();
+      try {
+        await _service.deleteProduct(p.id);
+        _load();
+      } on PostgrestException catch (e) {
+        if (!mounted) return;
+        final message = e.code == '23503'
+            ? 'Ce produit a des achats enregistrés et ne peut pas être supprimé.'
+            : 'Erreur Supabase (${e.code ?? '?'}): ${e.message}';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erreur inattendue: $e')),
+        );
+      }
     }
   }
 
@@ -177,7 +194,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
   @override
   Widget build(BuildContext context) {
     final products = _filtered;
-    final lowStockCount = _allProducts.where((p) => p.stock < kLowStockThreshold).length;
+    final lowStockCount = _allProducts.where((p) => p.isLowStock).length;
     return Scaffold(
       appBar: AppBar(
         leading: const Padding(padding: EdgeInsets.all(10), child: AppLogo(size: 26)),
@@ -298,12 +315,12 @@ class _ProductsScreenState extends State<ProductsScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           CategoryIconPicker(
-            categories: _categories,
+            categories: _categories.where((c) => c.mode != CategoryMode.repair).toList(),
             selectedId: _selectedCategoryId,
             onSelect: _onCategoryChanged,
             allowClear: true,
           ),
-          if (_selectedCategoryId != null) ...[
+          if (_selectedCategoryId != null && !_selectedIsPerfume) ...[
             const SizedBox(height: 12),
             TypeChipSelector(
               label: 'Type',
@@ -381,7 +398,7 @@ class _ProductCard extends StatelessWidget {
 
   const _ProductCard({required this.product, required this.onTap, required this.onDelete});
 
-  bool get _lowStock => product.stock < kLowStockThreshold;
+  bool get _lowStock => product.isLowStock;
 
   @override
   Widget build(BuildContext context) {
@@ -488,7 +505,10 @@ class _ProductCard extends StatelessWidget {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  Text('${product.prix} DA', style: const TextStyle(fontWeight: FontWeight.bold, color: AppColors.black)),
+                  Text(
+                    product.hasFixedPrice ? '${product.prix} DA' : 'Prix / taille',
+                    style: const TextStyle(fontWeight: FontWeight.bold, color: AppColors.black),
+                  ),
                   IconButton(
                     icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
                     onPressed: onDelete,

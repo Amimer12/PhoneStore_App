@@ -92,6 +92,7 @@ class SupabaseService {
     String? imageUrl,
     required int level,
     double? volumeLiters,
+    int? prix,
   }) async {
     final map = {
       'category_id': categoryId,
@@ -100,6 +101,7 @@ class SupabaseService {
       'image_url': imageUrl,
       'level': level,
       'volume_liters': volumeLiters,
+      'prix': prix,
     };
     int resultId;
     if (id == null) {
@@ -119,16 +121,18 @@ class SupabaseService {
   }
 
   // ---------------- MARQUES ----------------
-  Future<List<Marque>> getMarques() async {
-    if (_marquesCache != null) return _marquesCache!;
-    final data = await _c.from('marques').select().order('name');
-    _marquesCache = (data as List).map((e) => Marque.fromMap(e)).toList();
-    return _marquesCache!;
+  Future<List<Marque>> getMarques({MarqueType? type}) async {
+    if (_marquesCache == null) {
+      final data = await _c.from('marques').select().order('name');
+      _marquesCache = (data as List).map((e) => Marque.fromMap(e)).toList();
+    }
+    if (type == null) return _marquesCache!;
+    return _marquesCache!.where((m) => m.type == type).toList();
   }
 
   /// Returns the marque id (existing id on update, new id on insert).
-  Future<int> upsertMarque({int? id, required String name}) async {
-    final map = {'name': name};
+  Future<int> upsertMarque({int? id, required String name, MarqueType type = MarqueType.tech}) async {
+    final map = {'name': name, 'type': marqueTypeToString(type)};
     int resultId;
     if (id == null) {
       final row = await _c.from('marques').insert(map).select('id').single();
@@ -179,10 +183,18 @@ class SupabaseService {
   Future<void> deleteProduct(int id) => _c.from('products').delete().eq('id', id);
 
   // ---------------- ACHATS ----------------
+  static const _achatItemSelect = '''
+    *,
+    products:product_id ($_productSelect),
+    taille:type2_id ( name, volume_liters, prix ),
+    categories:category_id ( name, icon_key ),
+    achat_item_types ( type_id )
+  ''';
+
   Future<List<Achat>> getAchats() async {
     final data = await _c
         .from('achats')
-        .select('*, achat_items ( *, products:product_id ($_productSelect), taille:type2_id ( name ) )')
+        .select('*, achat_items ( $_achatItemSelect )')
         .order('achat_date', ascending: false)
         .order('achat_time', ascending: false);
     return (data as List).map((e) => Achat.fromMap(e)).toList();
@@ -210,24 +222,24 @@ class SupabaseService {
         .select('id')
         .single();
     final achatId = achatRow['id'] as int;
-    final itemRows = items
-        .map((i) => {
-              'achat_id': achatId,
-              'product_id': i.productId,
-              'quantity': i.quantity,
-              'unit_price': i.unitPrice,
-              'type2_id': i.type2Id,
-            })
-        .toList();
-    await _c.from('achat_items').insert(itemRows);
+    await _insertAchatItems(achatId: achatId, items: items);
     return achatId;
   }
 
   Future<void> deleteAchat(int id) => _c.from('achats').delete().eq('id', id);
 
   Future<void> updateAchatItems({required int achatId, required List<AchatItem> items}) async {
-    // simplest safe approach: replace all items for this achat
+    // simplest safe approach: replace all items for this achat. Deleting
+    // achat_items cascades into achat_item_types automatically.
     await _c.from('achat_items').delete().eq('achat_id', achatId);
+    await _insertAchatItems(achatId: achatId, items: items);
+  }
+
+  /// Inserts achat_items rows for [items], then — for any repair combo line
+  /// carrying bundled type ids — inserts the matching achat_item_types rows
+  /// once the real achat_item ids come back from Postgres.
+  Future<void> _insertAchatItems({required int achatId, required List<AchatItem> items}) async {
+    if (items.isEmpty) return;
     final itemRows = items
         .map((i) => {
               'achat_id': achatId,
@@ -235,9 +247,20 @@ class SupabaseService {
               'quantity': i.quantity,
               'unit_price': i.unitPrice,
               'type2_id': i.type2Id,
+              'category_id': i.categoryId,
+              'label': i.label,
             })
         .toList();
-    await _c.from('achat_items').insert(itemRows);
+    final inserted = await _c.from('achat_items').insert(itemRows).select('id');
+    final insertedIds = (inserted as List).map((r) => r['id'] as int).toList();
+
+    final comboRows = <Map<String, dynamic>>[];
+    for (var i = 0; i < items.length; i++) {
+      for (final typeId in items[i].typeIds) {
+        comboRows.add({'achat_item_id': insertedIds[i], 'type_id': typeId});
+      }
+    }
+    if (comboRows.isNotEmpty) await _c.from('achat_item_types').insert(comboRows);
   }
 
   // ---------------- DEPENSES (store expenses) ----------------
