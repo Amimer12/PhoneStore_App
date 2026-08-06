@@ -7,6 +7,10 @@ import '../models/product.dart';
 import '../models/achat.dart';
 import '../models/depense.dart';
 
+/// Which ranking to use for "top products" / "top repairs": by units sold
+/// or by revenue generated. Both are precomputed in the matview via RANK().
+enum TopProductsMetric { quantity, revenue }
+
 /// Single access point to Supabase: tables, storage, and analytics views.
 /// Keeping every query in one place makes the screens thin and easy to read.
 ///
@@ -288,20 +292,83 @@ class SupabaseService {
   }
 
   // ---------------- ANALYTICS ----------------
+  // achat_date is stamped from the device's local clock (see createAchat),
+  // so every analytics query that means "today" or "this month" reuses
+  // that same local date rather than the DB server's UTC clock — otherwise
+  // a late-evening sale in a UTC+1 shop could fall on the wrong side of
+  // the KPI's day/month boundary.
+  String _localDateString(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  /// Single round trip for the KPI row at the top of the Analyse page:
+  /// achats today (sum + count), achats this month (sum + count),
+  /// depenses this month, net profit, and month-over-month growth %.
+  Future<Map<String, dynamic>> getAnalyticsKpis() async {
+    final today = _localDateString(DateTime.now());
+    final data = await _c.rpc('get_analytics_kpis', params: {'p_today': today});
+    final rows = (data as List).cast<Map<String, dynamic>>();
+    return rows.isNotEmpty ? rows.first : const {};
+  }
+
+  /// Achats count + revenue per hour (0-23) for today — zero-filled by the
+  /// SQL function, so the bar chart never has to guess at missing hours.
+  Future<List<Map<String, dynamic>>> getHourlyAchatsToday() async {
+    final today = _localDateString(DateTime.now());
+    final data = await _c.rpc('get_hourly_achats', params: {'p_date': today});
+    return (data as List).cast<Map<String, dynamic>>();
+  }
+
+  /// Daily revenue history for the line chart. Values are per-day, not
+  /// cumulative — the screen itself decides whether to plot raw or a
+  /// running total.
   Future<List<Map<String, dynamic>>> getDailyRevenue() async {
-    final data = await _c.from('v_daily_revenue').select().order('achat_date');
+    final data = await _c.from('mv_daily_revenue').select().order('achat_date');
     return (data as List).cast<Map<String, dynamic>>();
   }
 
-  Future<List<Map<String, dynamic>>> getTopProducts({int limit = 10}) async {
-    final data = await _c.from('v_top_products').select().limit(limit);
+  /// Top products, ranked either by units sold or by revenue (the two
+  /// metrics the user can toggle between) — both ranks live on the same
+  /// matview row, computed with RANK() in Postgres.
+  Future<List<Map<String, dynamic>>> getTopProducts({
+    int limit = 10,
+    TopProductsMetric metric = TopProductsMetric.quantity,
+  }) async {
+    final rankColumn = metric == TopProductsMetric.quantity ? 'rank_by_qty' : 'rank_by_revenue';
+    final data = await _c.from('mv_top_products').select().order(rankColumn).limit(limit);
     return (data as List).cast<Map<String, dynamic>>();
   }
 
+  /// Top repair/service combos (achat_items with no product_id), ranked
+  /// the same way as products. Previously invisible to analytics.
+  Future<List<Map<String, dynamic>>> getTopRepairs({
+    int limit = 10,
+    TopProductsMetric metric = TopProductsMetric.quantity,
+  }) async {
+    final rankColumn = metric == TopProductsMetric.quantity ? 'rank_by_qty' : 'rank_by_revenue';
+    final data = await _c.from('mv_top_repairs').select().order(rankColumn).limit(limit);
+    return (data as List).cast<Map<String, dynamic>>();
+  }
+
+  /// Revenue by category, including repair-line revenue (fixed — the old
+  /// view only joined through products and silently dropped repairs).
+  /// Excludes the ROLLUP grand-total row; use [getRevenueTotal] for that.
   Future<List<Map<String, dynamic>>> getRevenueByCategory() async {
-    final data = await _c.from('v_revenue_by_category').select();
+    final data = await _c.from('mv_revenue_by_category').select().eq('is_total', false).order('revenue', ascending: false);
     return (data as List).cast<Map<String, dynamic>>();
   }
+
+  /// The ROLLUP grand-total row from the same matview — one extra filter,
+  /// no extra query.
+  Future<int> getRevenueTotal() async {
+    final data = await _c.from('mv_revenue_by_category').select('revenue').eq('is_total', true).maybeSingle();
+    return (data?['revenue'] as num?)?.toInt() ?? 0;
+  }
+
+  /// Recomputes every analytics matview. Bound to the refresh button on
+  /// the Analyse page instead of firing on every achat/achat_item write —
+  /// a sale shouldn't pay the cost of recomputing all of sales history
+  /// just to add one row.
+  Future<void> refreshAnalytics() => _c.rpc('refresh_analytics');
 
   // ---------------- STORAGE ----------------
   static const _bucket = 'shop-images';

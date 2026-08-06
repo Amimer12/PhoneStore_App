@@ -9,6 +9,7 @@ import 'product_form.dart';
 import 'catalog_screen.dart';
 import '../../widgets/selector_chips.dart';
 import '../../widgets/app_logo.dart';
+import '../../services/auth_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 enum _ProductSort { defaultOrder, priceAsc, priceDesc, stockAsc, stockDesc }
@@ -44,7 +45,11 @@ extension on _ProductSort {
 }
 
 class ProductsScreen extends StatefulWidget {
-  const ProductsScreen({super.key});
+  /// Workers get a read-only version of this screen: no "Ajouter" FAB, no
+  /// catalog management, no delete, and tapping a product shows details
+  /// instead of opening the edit form.
+  final bool isAdmin;
+  const ProductsScreen({super.key, this.isAdmin = true});
 
   @override
   State<ProductsScreen> createState() => _ProductsScreenState();
@@ -52,6 +57,7 @@ class ProductsScreen extends StatefulWidget {
 
 class _ProductsScreenState extends State<ProductsScreen> {
   final _service = SupabaseService.instance;
+  bool get _isAdmin => widget.isAdmin;
 
   List<Category> _categories = [];
   List<ProductType> _type1Options = [];
@@ -148,6 +154,44 @@ class _ProductsScreenState extends State<ProductsScreen> {
     if (saved == true) _load();
   }
 
+  /// Workers can look up a product's full details, they just can't change
+  /// anything — this stays a plain read-only dialog rather than opening the
+  /// real edit form (product_form.dart is admin-only).
+  void _showReadOnlyDetails(Product p) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(p.displayLabel),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _detailRow('Référence', p.reference),
+            _detailRow('Prix', p.hasFixedPrice ? '${p.prix} DA' : 'Selon taille'),
+            _detailRow('Stock', p.stockLabel),
+            if (p.categoryName != null) _detailRow('Catégorie', p.categoryName!),
+            if (p.type1Name != null) _detailRow('Type', p.type1Name!),
+            if (p.type2Name != null) _detailRow('Variante', p.type2Name!),
+            if (p.marqueName != null) _detailRow('Marque', p.marqueName!),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Fermer')),
+        ],
+      ),
+    );
+  }
+
+  Widget _detailRow(String label, String value) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(
+          children: [
+            SizedBox(width: 90, child: Text(label, style: const TextStyle(color: AppColors.grey, fontSize: 12.5))),
+            Expanded(child: Text(value, style: const TextStyle(fontWeight: FontWeight.w600))),
+          ],
+        ),
+      );
+
   Future<void> _confirmDelete(Product p) async {
     final ok = await showDialog<bool>(
       context: context,
@@ -205,28 +249,31 @@ class _ProductsScreenState extends State<ProductsScreen> {
             tooltip: 'Trier',
             onPressed: _openSort,
           ),
-          IconButton(
-            icon: const Icon(Icons.category_outlined),
-            tooltip: 'Gérer catégories / types / marques',
-            onPressed: () async {
-              await Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const CatalogScreen()),
-              );
-              _load();
-            },
-          ),
+          if (_isAdmin)
+            IconButton(
+              icon: const Icon(Icons.category_outlined),
+              tooltip: 'Gérer catégories / types / marques',
+              onPressed: () async {
+                await Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const CatalogScreen()),
+                );
+                _load();
+              },
+            ),
           IconButton(
             icon: const Icon(Icons.logout),
             tooltip: 'Se déconnecter',
-            onPressed: () => Supabase.instance.client.auth.signOut(),
+            onPressed: () => AuthService.instance.signOut(),
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _openForm(),
-        icon: const Icon(Icons.add),
-        label: const Text('Ajouter'),
-      ),
+      floatingActionButton: _isAdmin
+          ? FloatingActionButton.extended(
+              onPressed: () => _openForm(),
+              icon: const Icon(Icons.add),
+              label: const Text('Ajouter'),
+            )
+          : null,
       body: Column(
         children: [
           Padding(
@@ -297,8 +344,8 @@ class _ProductsScreenState extends State<ProductsScreen> {
                           separatorBuilder: (_, __) => const SizedBox(height: 10),
                           itemBuilder: (_, i) => _ProductCard(
                             product: products[i],
-                            onTap: () => _openForm(product: products[i]),
-                            onDelete: () => _confirmDelete(products[i]),
+                            onTap: () => _isAdmin ? _openForm(product: products[i]) : _showReadOnlyDetails(products[i]),
+                            onDelete: _isAdmin ? () => _confirmDelete(products[i]) : null,
                           ),
                         ),
                       ),
@@ -394,7 +441,7 @@ class _ProductSortSheet extends StatelessWidget {
 class _ProductCard extends StatelessWidget {
   final Product product;
   final VoidCallback onTap;
-  final VoidCallback onDelete;
+  final VoidCallback? onDelete;
 
   const _ProductCard({required this.product, required this.onTap, required this.onDelete});
 
@@ -509,12 +556,13 @@ class _ProductCard extends StatelessWidget {
                     product.hasFixedPrice ? '${product.prix} DA' : 'Prix / taille',
                     style: const TextStyle(fontWeight: FontWeight.bold, color: AppColors.black),
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
-                    onPressed: onDelete,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                  ),
+                  if (onDelete != null)
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
+                      onPressed: onDelete,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                    ),
                 ],
               ),
             ],
