@@ -6,18 +6,38 @@ import '../models/marque.dart';
 import '../models/product.dart';
 import '../models/achat.dart';
 import '../models/depense.dart';
+import '../models/worker_permissions.dart';
+import 'query_cache.dart';
 
 /// Which ranking to use for "top products" / "top repairs": by units sold
-/// or by revenue generated. Both are precomputed in the matview via RANK().
-enum TopProductsMetric { quantity, revenue }
+/// or by net profit generated. Both are precomputed in the matview via
+/// RANK() (rank_by_qty / rank_by_profit).
+enum TopProductsMetric { quantity, profit }
+
+/// Which column the products list is ordered/paginated by. Kept in sync
+/// with the sort chip in ProductsScreen so that "load more" always fetches
+/// the next slice in the SAME order the user is looking at, instead of
+/// re-sorting only what happens to be loaded on the device.
+enum ProductSort { defaultOrder, priceAsc, priceDesc, stockAsc, stockDesc }
+
+/// One "page" of products for the chunked Produits list, plus whether
+/// another page exists — so the screen knows whether to show "Voir plus".
+class ProductsPage {
+  final List<Product> products;
+  final bool hasMore;
+  const ProductsPage({required this.products, required this.hasMore});
+}
 
 /// Single access point to Supabase: tables, storage, and analytics views.
 /// Keeping every query in one place makes the screens thin and easy to read.
 ///
 /// Categories, product types, and marques change rarely, so this service
 /// caches them in memory for the lifetime of the app session and only
-/// re-fetches after a write. That keeps read traffic (and your Supabase
-/// usage) low without adding a real caching layer.
+/// re-fetches after a write. Products (paged, per category/filter/sort) and
+/// achats (paged, per day) are cached the same way through [QueryCache], so
+/// scrolling back up, re-opening a category, or two widgets asking for the
+/// same page at once never re-issues the same Supabase query — see
+/// query_cache.dart.
 class SupabaseService {
   SupabaseService._();
   static final SupabaseService instance = SupabaseService._();
@@ -28,7 +48,31 @@ class SupabaseService {
   List<Marque>? _marquesCache;
   final Map<String, List<ProductType>> _typesCache = {};
 
+  final QueryCache<ProductsPage> _productsPageCache = QueryCache<ProductsPage>();
+  final QueryCache<Product> _productDetailCache = QueryCache<Product>();
+  final QueryCache<List<String>> _achatDatesCache = QueryCache<List<String>>();
+  final QueryCache<List<Achat>> _achatsByDateCache = QueryCache<List<Achat>>();
+  WorkerPermissions? _permissionsCache;
+
   void _invalidateTypesCache() => _typesCache.clear();
+
+  /// Every product-page cache entry is invalidated on ANY product write —
+  /// we don't try to guess which page/category a given product id landed
+  /// on, and products are a small enough catalog that a full re-fetch on
+  /// the next screen visit is cheap.
+  void _invalidateProductsCache() {
+    _productsPageCache.clear();
+    _productDetailCache.clear();
+  }
+
+  /// A new/edited/deleted achat can shift which date buckets exist (e.g.
+  /// the very first sale of a new day) and always changes the totals for
+  /// the day it belongs to, so both caches are dropped wholesale. Achats
+  /// history is small per-day, so this is cheap.
+  void _invalidateAchatsCache() {
+    _achatDatesCache.clear();
+    _achatsByDateCache.clear();
+  }
 
   // ---------------- CATEGORIES ----------------
   Future<List<Category>> getCategories() async {
@@ -55,12 +99,14 @@ class SupabaseService {
       resultId = id;
     }
     _categoriesCache = null;
+    _invalidateProductsCache();
     return resultId;
   }
 
   Future<void> deleteCategory(int id) async {
     await _c.from('categories').delete().eq('id', id);
     _categoriesCache = null;
+    _invalidateProductsCache();
   }
 
   // ---------------- PRODUCT TYPES (2 levels: type1 -> optional type2) ----------------
@@ -97,6 +143,7 @@ class SupabaseService {
     required int level,
     double? volumeLiters,
     int? prix,
+    bool stockAlertActivated = true,
   }) async {
     final map = {
       'category_id': categoryId,
@@ -106,6 +153,7 @@ class SupabaseService {
       'level': level,
       'volume_liters': volumeLiters,
       'prix': prix,
+      'stock_alert_activated': stockAlertActivated,
     };
     int resultId;
     if (id == null) {
@@ -116,12 +164,14 @@ class SupabaseService {
       resultId = id;
     }
     _invalidateTypesCache();
+    _invalidateProductsCache();
     return resultId;
   }
 
   Future<void> deleteType(int id) async {
     await _c.from('product_types').delete().eq('id', id);
     _invalidateTypesCache();
+    _invalidateProductsCache();
   }
 
   // ---------------- MARQUES ----------------
@@ -146,25 +196,120 @@ class SupabaseService {
       resultId = id;
     }
     _marquesCache = null;
+    _invalidateProductsCache();
     return resultId;
   }
 
   Future<void> deleteMarque(int id) async {
     await _c.from('marques').delete().eq('id', id);
     _marquesCache = null;
+    _invalidateProductsCache();
   }
 
   // ---------------- PRODUCTS ----------------
-  static const _productSelect = '''
-    *,
+  // Two different projections on purpose:
+  //  - _productListSelect: what the chunked list actually needs to render a
+  //    card (name/prix/stock/reference/image + the joined display names).
+  //    Deliberately leaves out prix_achat (cost price) — that's
+  //    admin-sensitive and irrelevant to a scrolling list, so there's no
+  //    reason to ship it to every card.
+  //  - _productDetailSelect: the full row, fetched once when a single
+  //    product is opened (edit form, or the worker's read-only detail
+  //    dialog) — this is the only place prix_achat/margin is needed.
+  static const _joinedNames = '''
     categories:category_id ( name, icon_key, mode ),
-    type1:type1_id ( name, image_url ),
-    type2:type2_id ( name, image_url ),
+    type1:type1_id ( name, image_url, stock_alert_activated ),
+    type2:type2_id ( name, image_url, stock_alert_activated ),
     marques:marque_id ( name )
   ''';
+  static const _productListSelect = '''
+    id, name, reference, category_id, type1_id, type2_id, marque_id,
+    prix, stock, image_url,
+    $_joinedNames
+  ''';
+  static const _productDetailSelect = '*, $_joinedNames';
 
+  String _sortColumn(ProductSort sort) {
+    switch (sort) {
+      case ProductSort.defaultOrder:
+        return 'id';
+      case ProductSort.priceAsc:
+      case ProductSort.priceDesc:
+        return 'prix';
+      case ProductSort.stockAsc:
+      case ProductSort.stockDesc:
+        return 'stock';
+    }
+  }
+
+  bool _sortAscending(ProductSort sort) {
+    switch (sort) {
+      case ProductSort.defaultOrder:
+        return false; // newest first, matches the old default
+      case ProductSort.priceAsc:
+      case ProductSort.stockAsc:
+        return true;
+      case ProductSort.priceDesc:
+      case ProductSort.stockDesc:
+        return false;
+    }
+  }
+
+  /// Chunked product fetch used by the "slide down / Voir plus" Produits
+  /// list. Fetches [pageSize] rows starting at [page] * [pageSize] (server
+  /// side, via `.range`), ordered to match [sort] so pages stay globally
+  /// correct as more are loaded (page 2 sorted by price really is the next
+  /// cheapest/most expensive slice, not just "whatever loaded next").
+  ///
+  /// Cached per (category, type1, type2, sort, page) — flipping back to an
+  /// already-loaded page (e.g. scrolling up) is free.
+  Future<ProductsPage> getProductsPage({
+    int? categoryId,
+    int? type1Id,
+    int? type2Id,
+    required int page,
+    int pageSize = 20,
+    ProductSort sort = ProductSort.defaultOrder,
+  }) async {
+    final key = 'products:$categoryId:$type1Id:$type2Id:${sort.name}:$page:$pageSize';
+    return _productsPageCache.getOrFetch(key, () async {
+      var query = _c.from('products').select(_productListSelect);
+      if (categoryId != null) query = query.eq('category_id', categoryId);
+      if (type1Id != null) query = query.eq('type1_id', type1Id);
+      if (type2Id != null) query = query.eq('type2_id', type2Id);
+
+      final from = page * pageSize;
+      // Ask for one extra row past the page size — if it comes back, we
+      // know there's another page without a second round trip just to get
+      // a count.
+      final to = from + pageSize; // inclusive range, so this is pageSize+1 rows
+      final data = await query
+          .order(_sortColumn(sort), ascending: _sortAscending(sort))
+          .range(from, to);
+      final rows = (data as List);
+      final hasMore = rows.length > pageSize;
+      final products = rows.take(pageSize).map((e) => Product.fromMap(e as Map<String, dynamic>)).toList();
+      return ProductsPage(products: products, hasMore: hasMore);
+    });
+  }
+
+  /// Full product row (including prix_achat), fetched once a card is
+  /// actually tapped. Cached by id so re-opening the same product (e.g.
+  /// closing and reopening the edit form) doesn't re-fetch.
+  Future<Product> getProductById(int id) {
+    return _productDetailCache.getOrFetch('product:$id', () async {
+      final row = await _c.from('products').select(_productDetailSelect).eq('id', id).single();
+      return Product.fromMap(row);
+    });
+  }
+
+  /// Unpaginated fetch, kept for call sites that genuinely need "every
+  /// product matching this filter" in one shot (achat_form's product
+  /// picker does its own client-side category/type narrowing over the full
+  /// catalog rather than paging, since it's a modal picker, not the main
+  /// scrolling list).
   Future<List<Product>> getProducts({int? categoryId, int? type1Id, int? type2Id}) async {
-    var query = _c.from('products').select(_productSelect);
+    var query = _c.from('products').select(_productDetailSelect);
     if (categoryId != null) query = query.eq('category_id', categoryId);
     if (type1Id != null) query = query.eq('type1_id', type1Id);
     if (type2Id != null) query = query.eq('type2_id', type2Id);
@@ -175,26 +320,35 @@ class SupabaseService {
   /// Returns the product id (existing id on update, new id on insert).
   Future<int> upsertProduct({int? id, required Product product}) async {
     final map = product.toMap();
+    int resultId;
     if (id == null) {
       final row = await _c.from('products').insert(map).select('id').single();
-      return row['id'] as int;
+      resultId = row['id'] as int;
     } else {
       await _c.from('products').update(map).eq('id', id);
-      return id;
+      resultId = id;
     }
+    _invalidateProductsCache();
+    return resultId;
   }
 
-  Future<void> deleteProduct(int id) => _c.from('products').delete().eq('id', id);
+  Future<void> deleteProduct(int id) async {
+    await _c.from('products').delete().eq('id', id);
+    _invalidateProductsCache();
+  }
 
   // ---------------- ACHATS ----------------
   static const _achatItemSelect = '''
     *,
-    products:product_id ($_productSelect),
+    products:product_id ($_productDetailSelect),
     taille:type2_id ( name, volume_liters, prix ),
     categories:category_id ( name, icon_key ),
     achat_item_types ( type_id )
   ''';
 
+  // Kept for callers that genuinely want the entire sales history in one
+  // shot (e.g. a future export screen) — the Ventes tab itself should
+  // prefer [getAchatDates] + [getAchatsForDates] (see below).
   Future<List<Achat>> getAchats() async {
     final data = await _c
         .from('achats')
@@ -202,6 +356,56 @@ class SupabaseService {
         .order('achat_date', ascending: false)
         .order('achat_time', ascending: false);
     return (data as List).map((e) => Achat.fromMap(e)).toList();
+  }
+
+  /// Distinct achat dates, most recent first — this is what powers "last 3
+  /// days, then Voir plus for one more day at a time": the screen asks for
+  /// [limit] dates starting after [offset] already-loaded ones, not for
+  /// achats directly, so a day with 40 sales costs the same as a day with
+  /// one.
+  ///
+  /// Backed by the `get_achat_dates` SQL function (see
+  /// worker_permissions.sql) instead of `SELECT DISTINCT achat_date FROM
+  /// achats` through PostgREST, which would have no way to DISTINCT
+  /// server-side and would pull one row per achat just to compute it
+  /// client-side.
+  Future<List<String>> getAchatDates({required int limit, required int offset}) {
+    final key = 'achat_dates:$offset:$limit';
+    return _achatDatesCache.getOrFetch(key, () async {
+      final data = await _c.rpc('get_achat_dates', params: {'p_limit': limit, 'p_offset': offset});
+      return (data as List).map((e) => (e as Map<String, dynamic>)['achat_date'] as String).toList();
+    });
+  }
+
+  /// All achats (with items) for a specific set of dates — used to hydrate
+  /// whichever dates [getAchatDates] just returned. Cached per date so
+  /// re-requesting a date already on screen (e.g. after a filter is
+  /// cleared) doesn't re-fetch it, and dates that are already cached are
+  /// excluded from the batch request entirely.
+  Future<List<Achat>> getAchatsForDates(List<String> dates) async {
+    if (dates.isEmpty) return [];
+    final uncached = dates.where((d) => !_achatsByDateCache.isCached(d)).toList();
+    if (uncached.isNotEmpty) {
+      final data = await _c
+          .from('achats')
+          .select('*, achat_items ( $_achatItemSelect )')
+          .inFilter('achat_date', uncached)
+          .order('achat_date', ascending: false)
+          .order('achat_time', ascending: false);
+      final byDate = <String, List<Achat>>{};
+      for (final row in (data as List)) {
+        final map = row as Map<String, dynamic>;
+        byDate.putIfAbsent(map['achat_date'] as String, () => []).add(Achat.fromMap(map));
+      }
+      for (final d in uncached) {
+        await _achatsByDateCache.getOrFetch(d, () async => byDate[d] ?? const []);
+      }
+    }
+    final result = <Achat>[];
+    for (final d in dates) {
+      result.addAll(await _achatsByDateCache.getOrFetch(d, () async => const []));
+    }
+    return result;
   }
 
   /// Creates an achat with its items in one call. Total price and stock are
@@ -227,16 +431,23 @@ class SupabaseService {
         .single();
     final achatId = achatRow['id'] as int;
     await _insertAchatItems(achatId: achatId, items: items);
+    _invalidateAchatsCache();
+    _invalidateProductsCache(); // stock changed
     return achatId;
   }
 
-  Future<void> deleteAchat(int id) => _c.from('achats').delete().eq('id', id);
+  Future<void> deleteAchat(int id) async {
+    await _c.from('achats').delete().eq('id', id);
+    _invalidateAchatsCache();
+  }
 
   Future<void> updateAchatItems({required int achatId, required List<AchatItem> items}) async {
     // simplest safe approach: replace all items for this achat. Deleting
     // achat_items cascades into achat_item_types automatically.
     await _c.from('achat_items').delete().eq('achat_id', achatId);
     await _insertAchatItems(achatId: achatId, items: items);
+    _invalidateAchatsCache();
+    _invalidateProductsCache(); // stock changed
   }
 
   /// Inserts achat_items rows for [items], then — for any repair combo line
@@ -250,6 +461,7 @@ class SupabaseService {
               'product_id': i.productId,
               'quantity': i.quantity,
               'unit_price': i.unitPrice,
+              'unit_cost': i.unitCost,
               'type2_id': i.type2Id,
               'category_id': i.categoryId,
               'label': i.label,
@@ -289,6 +501,24 @@ class SupabaseService {
   Future<List<Map<String, dynamic>>> getDailyDepenses() async {
     final data = await _c.from('v_daily_depenses').select().order('depense_date');
     return (data as List).cast<Map<String, dynamic>>();
+  }
+
+  // ---------------- WORKER PERMISSIONS ----------------
+  /// Cached for the app session; the admin's Permissions screen calls
+  /// [updateWorkerPermissions] which refreshes this cache, and
+  /// PermissionsService pushes the new value into its own notifier so
+  /// every screen reacts immediately without a manual reload.
+  Future<WorkerPermissions> getWorkerPermissions() async {
+    if (_permissionsCache != null) return _permissionsCache!;
+    final row = await _c.from('worker_permissions').select().eq('id', 1).maybeSingle();
+    _permissionsCache = row == null ? WorkerPermissions.defaults : WorkerPermissions.fromMap(row);
+    return _permissionsCache!;
+  }
+
+  /// Upserts the singleton row (id is always 1 — see worker_permissions.sql).
+  Future<void> updateWorkerPermissions(WorkerPermissions permissions) async {
+    await _c.from('worker_permissions').upsert({'id': 1, ...permissions.toMap()});
+    _permissionsCache = permissions;
   }
 
   // ---------------- ANALYTICS ----------------
@@ -333,7 +563,7 @@ class SupabaseService {
     int limit = 10,
     TopProductsMetric metric = TopProductsMetric.quantity,
   }) async {
-    final rankColumn = metric == TopProductsMetric.quantity ? 'rank_by_qty' : 'rank_by_revenue';
+    final rankColumn = metric == TopProductsMetric.quantity ? 'rank_by_qty' : 'rank_by_profit';
     final data = await _c.from('mv_top_products').select().order(rankColumn).limit(limit);
     return (data as List).cast<Map<String, dynamic>>();
   }
@@ -344,7 +574,7 @@ class SupabaseService {
     int limit = 10,
     TopProductsMetric metric = TopProductsMetric.quantity,
   }) async {
-    final rankColumn = metric == TopProductsMetric.quantity ? 'rank_by_qty' : 'rank_by_revenue';
+    final rankColumn = metric == TopProductsMetric.quantity ? 'rank_by_qty' : 'rank_by_profit';
     final data = await _c.from('mv_top_repairs').select().order(rankColumn).limit(limit);
     return (data as List).cast<Map<String, dynamic>>();
   }

@@ -4,6 +4,7 @@ import '../../models/achat.dart';
 import '../../models/category.dart';
 import '../../models/product_type.dart';
 import '../../services/supabase_service.dart';
+import '../../services/permissions_service.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/category_icons.dart';
 import '../../widgets/app_logo.dart';
@@ -11,6 +12,11 @@ import '../../widgets/selector_chips.dart';
 import 'achat_form.dart';
 
 enum _AchatSort { dateDesc, dateAsc, priceDesc, priceAsc }
+
+/// How many calendar days the Ventes screen loads up front, and how many
+/// more it loads each time "Voir plus" is tapped.
+const int _kInitialDays = 3;
+const int _kMoreDaysPerTap = 1;
 
 class AchatsScreen extends StatefulWidget {
   const AchatsScreen({super.key});
@@ -21,10 +27,18 @@ class AchatsScreen extends StatefulWidget {
 
 class _AchatsScreenState extends State<AchatsScreen> {
   final _service = SupabaseService.instance;
+  final _perms = PermissionsService.instance;
+
+  /// Achat dates loaded so far, most recent first — the unit of pagination
+  /// here is a whole calendar day, not an individual achat (see the class
+  /// doc on getAchatDates/getAchatsForDates in supabase_service.dart).
+  List<String> _loadedDates = [];
   List<Achat> _achats = [];
   List<Category> _categories = [];
   List<ProductType> _type1Options = [];
   bool _loading = true;
+  bool _loadingMoreDays = false;
+  bool _hasMoreDays = true;
 
   // Filters
   DateTimeRange? _dateRange;
@@ -42,9 +56,50 @@ class _AchatsScreenState extends State<AchatsScreen> {
 
   Future<void> _load() async {
     setState(() => _loading = true);
-    _achats = await _service.getAchats();
     _categories = await _service.getCategories();
-    setState(() => _loading = false);
+    _loadedDates = await _service.getAchatDates(limit: _kInitialDays, offset: 0);
+    _hasMoreDays = _loadedDates.length == _kInitialDays;
+    _achats = await _service.getAchatsForDates(_loadedDates);
+    if (mounted) setState(() => _loading = false);
+  }
+
+  /// "Voir plus" — pulls in one more (older) calendar day and hydrates it.
+  Future<void> _loadMoreDays() async {
+    if (_loadingMoreDays || !_hasMoreDays) return;
+    setState(() => _loadingMoreDays = true);
+    try {
+      final more = await _service.getAchatDates(limit: _kMoreDaysPerTap, offset: _loadedDates.length);
+      if (more.isEmpty) {
+        if (mounted) setState(() => _hasMoreDays = false);
+        return;
+      }
+      final newAchats = await _service.getAchatsForDates(more);
+      if (!mounted) return;
+      setState(() {
+        _loadedDates = [..._loadedDates, ...more];
+        _achats = [..._achats, ...newAchats];
+        _hasMoreDays = more.length == _kMoreDaysPerTap;
+      });
+    } finally {
+      if (mounted) setState(() => _loadingMoreDays = false);
+    }
+  }
+
+  /// Keeps loading older days until at least one loaded date is on or
+  /// before [target] (or there's nothing left to load) — used so picking a
+  /// date-range filter that reaches further back than what's on screen
+  /// doesn't just silently show an incomplete result. Capped so a
+  /// far-future-looking "from" date can't trigger an unbounded fetch loop.
+  Future<void> _ensureDatesLoadedUntil(DateTime target) async {
+    var guard = 0;
+    while (_hasMoreDays && guard < 120) {
+      final oldestLoaded = _loadedDates.isEmpty
+          ? null
+          : DateTime.parse(_loadedDates.last);
+      if (oldestLoaded != null && !oldestLoaded.isAfter(target)) break;
+      await _loadMoreDays();
+      guard++;
+    }
   }
 
   Future<void> _onCategoryChanged(int? id) async {
@@ -127,11 +182,64 @@ class _AchatsScreenState extends State<AchatsScreen> {
     if (saved == true) _load();
   }
 
+  /// Opens the real edit form if allowed, otherwise a plain read-only
+  /// summary — a worker without ventesModify must still be able to open a
+  /// sale and see what's in it (view access to Ventes is always on).
+  void _openAchat(Achat a) {
+    if (_perms.canModifyVentes) {
+      _openForm(achat: a);
+    } else {
+      _showReadOnlyDetails(a);
+    }
+  }
+
+  void _showReadOnlyDetails(Achat a) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(DateFormat('d MMM yyyy').format(a.date)),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ...a.items.map((it) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            it.isRepair ? (it.label ?? 'Réparation') : (it.product?.displayLabel ?? 'Produit'),
+                          ),
+                        ),
+                        Text('${it.quantity} x ${it.unitPrice} DA'),
+                      ],
+                    ),
+                  )),
+              const Divider(),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('Total', style: TextStyle(fontWeight: FontWeight.w700)),
+                  Text('${a.totalPrice} DA', style: const TextStyle(fontWeight: FontWeight.w700)),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Fermer')),
+        ],
+      ),
+    );
+  }
+
   Future<void> _confirmDelete(Achat a) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text('Supprimer cet achat ?'),
+        title: const Text('Supprimer cette vente ?'),
         content: Text('${DateFormat('dd/MM/yyyy').format(a.date)} · ${a.totalPrice} DA'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Annuler')),
@@ -163,7 +271,10 @@ class _AchatsScreenState extends State<AchatsScreen> {
         maxPrice: _maxPrice,
         onCategoryChanged: _onCategoryChanged,
         onType1Changed: (id) => setState(() => _type1Id = id),
-        onDateRangeChanged: (r) => setState(() => _dateRange = r),
+        onDateRangeChanged: (r) {
+          setState(() => _dateRange = r);
+          if (r != null) _ensureDatesLoadedUntil(r.start);
+        },
         onPriceChanged: (min, max) => setState(() {
           _minPrice = min;
           _maxPrice = max;
@@ -208,7 +319,7 @@ class _AchatsScreenState extends State<AchatsScreen> {
     return Scaffold(
       appBar: AppBar(
         leading: const Padding(padding: EdgeInsets.all(10), child: AppLogo(size: 26)),
-        title: const Text('Achats'),
+        title: const Text('Ventes'),
         actions: [
           IconButton(
             icon: Badge(
@@ -228,11 +339,13 @@ class _AchatsScreenState extends State<AchatsScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _openForm(),
-        icon: const Icon(Icons.add),
-        label: const Text('Nouvel achat'),
-      ),
+      floatingActionButton: _perms.canAddVentes
+          ? FloatingActionButton.extended(
+              onPressed: () => _openForm(),
+              icon: const Icon(Icons.add),
+              label: const Text('Nouvelle vente'),
+            )
+          : null,
       body: Column(
         children: [
           if (_hasActiveFilters) _ActiveFiltersBar(count: _activeFilterCount, onClear: _clearFilters),
@@ -242,7 +355,7 @@ class _AchatsScreenState extends State<AchatsScreen> {
                 : achats.isEmpty
                     ? Center(
                         child: Text(
-                          _hasActiveFilters ? 'Aucun achat pour ces filtres' : 'Aucun achat',
+                          _hasActiveFilters ? 'Aucune vente pour ces filtres' : 'Aucune vente',
                           style: const TextStyle(color: AppColors.grey),
                         ),
                       )
@@ -251,8 +364,14 @@ class _AchatsScreenState extends State<AchatsScreen> {
                         color: AppColors.gold,
                         child: ListView.builder(
                           padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
-                          itemCount: rows.length,
+                          // +1 for the trailing "Voir plus" (one more day) row
+                          // — hidden while a search/filter narrows what's on
+                          // screen, same rationale as the Produits list.
+                          itemCount: rows.length + (_hasMoreDays && !_hasActiveFilters ? 1 : 0),
                           itemBuilder: (_, i) {
+                            if (i >= rows.length) {
+                              return _VoirPlusJourButton(loading: _loadingMoreDays, onTap: _loadMoreDays);
+                            }
                             final row = rows[i];
                             if (row.isHeader) {
                               return _DateHeader(date: row.date!, topPadded: i != 0);
@@ -262,8 +381,8 @@ class _AchatsScreenState extends State<AchatsScreen> {
                               child: _AchatCard(
                                 achat: row.achat!,
                                 showDate: !_isDateGrouped,
-                                onTap: () => _openForm(achat: row.achat!),
-                                onDelete: () => _confirmDelete(row.achat!),
+                                onTap: () => _openAchat(row.achat!),
+                                onDelete: _perms.canDeleteVentes ? () => _confirmDelete(row.achat!) : null,
                               ),
                             );
                           },
@@ -271,6 +390,34 @@ class _AchatsScreenState extends State<AchatsScreen> {
                       ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Loads one more calendar day of sales history — the Ventes equivalent of
+/// the Produits list's "Voir plus".
+class _VoirPlusJourButton extends StatelessWidget {
+  final bool loading;
+  final VoidCallback onTap;
+  const _VoirPlusJourButton({required this.loading, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Center(
+        child: OutlinedButton.icon(
+          onPressed: loading ? null : onTap,
+          icon: loading
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.gold),
+                )
+              : const Icon(Icons.expand_more, size: 18),
+          label: Text(loading ? 'Chargement...' : 'Voir un jour de plus'),
+        ),
       ),
     );
   }
@@ -324,7 +471,7 @@ class _AchatCard extends StatelessWidget {
   final Achat achat;
   final bool showDate;
   final VoidCallback onTap;
-  final VoidCallback onDelete;
+  final VoidCallback? onDelete;
 
   const _AchatCard({required this.achat, required this.showDate, required this.onTap, required this.onDelete});
 
@@ -371,7 +518,7 @@ class _AchatCard extends StatelessWidget {
                         ),
                       ),
                     Text(
-                      firstNames.isNotEmpty ? firstNames : 'Achat',
+                      firstNames.isNotEmpty ? firstNames : 'Vente',
                       style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14.5),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -386,15 +533,17 @@ class _AchatCard extends StatelessWidget {
               ),
               const SizedBox(width: 8),
               Text('${achat.totalPrice} DA', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-              const SizedBox(width: 4),
-              InkWell(
-                borderRadius: BorderRadius.circular(20),
-                onTap: onDelete,
-                child: const Padding(
-                  padding: EdgeInsets.all(6),
-                  child: Icon(Icons.delete_outline, color: AppColors.danger, size: 18),
+              if (onDelete != null) ...[
+                const SizedBox(width: 4),
+                InkWell(
+                  borderRadius: BorderRadius.circular(20),
+                  onTap: onDelete,
+                  child: const Padding(
+                    padding: EdgeInsets.all(6),
+                    child: Icon(Icons.delete_outline, color: AppColors.danger, size: 18),
+                  ),
                 ),
-              ),
+              ],
             ],
           ),
         ),
@@ -527,7 +676,7 @@ class _AchatFilterSheetState extends State<_AchatFilterSheet> {
     final df = DateFormat('d MMM yyyy');
     return StatefulBuilder(
       builder: (context, setSheetState) => _SheetShell(
-        title: 'Filtrer les achats',
+        title: 'Filtrer les ventes',
         trailing: TextButton(
           onPressed: () {
             widget.onClear();

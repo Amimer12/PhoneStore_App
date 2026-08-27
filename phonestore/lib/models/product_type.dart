@@ -19,6 +19,13 @@ class ProductType {
   /// every non-perfume type row.
   final int? prix;
 
+  /// Whether products under this type participate in the low-stock alert
+  /// at all. Defaults to true. Meant to be switched off for a type the
+  /// store deliberately stocks one unit of at a time (e.g. a specific rare
+  /// phone model) — otherwise that type would sit permanently flagged as
+  /// "stock faible" even though that's just how it's normally stocked.
+  final bool stockAlertActivated;
+
   ProductType({
     required this.id,
     required this.categoryId,
@@ -28,6 +35,7 @@ class ProductType {
     required this.level,
     this.volumeLiters,
     this.prix,
+    this.stockAlertActivated = true,
   });
 
   factory ProductType.fromMap(Map<String, dynamic> map) => ProductType(
@@ -39,6 +47,7 @@ class ProductType {
         level: map['level'] as int? ?? 1,
         volumeLiters: (map['volume_liters'] as num?)?.toDouble(),
         prix: map['prix'] as int?,
+        stockAlertActivated: map['stock_alert_activated'] as bool? ?? true,
       );
 
   Map<String, dynamic> toMap() => {
@@ -49,6 +58,7 @@ class ProductType {
         'level': level,
         'volume_liters': volumeLiters,
         'prix': prix,
+        'stock_alert_activated': stockAlertActivated,
       };
 
   /// e.g. "100ml" for 0.1L, "1.5L" for 1.5 — used to label taille chips.

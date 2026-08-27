@@ -13,6 +13,10 @@ class Product {
   /// Null for perfume-category products — the price now lives on the
   /// taille (bottle size) chosen at purchase time, not on the product.
   final int? prix;
+  /// What the store paid for one unit ("prix d'achat" / cost price).
+  /// Null means "not tracked yet". Snapshotted into AchatItem.unitCost at
+  /// sale time, so editing this later never rewrites past profit numbers.
+  final int? prixAchat;
   /// Null means "not tracked" — only meaningful for 'simple' category
   /// products, where stock is optional. Hierarchical/perfume products
   /// always get a numeric value (defaulting to 0) from the form.
@@ -29,6 +33,13 @@ class Product {
   final String? type2ImageUrl;
   final String? marqueName;
 
+  /// Whether type1/type2 have the low-stock alert switched on (see
+  /// ProductType.stockAlertActivated). Null when that type isn't set on
+  /// this product, or when the query didn't join it — both treated as "no
+  /// opinion", i.e. alert stays on for that side.
+  final bool? type1StockAlertActivated;
+  final bool? type2StockAlertActivated;
+
   Product({
     required this.id,
     required this.reference,
@@ -38,6 +49,7 @@ class Product {
     this.type2Id,
     this.marqueId,
     this.prix,
+    this.prixAchat,
     this.stock,
     this.imageUrl,
     this.categoryName,
@@ -48,6 +60,8 @@ class Product {
     this.type2Name,
     this.type2ImageUrl,
     this.marqueName,
+    this.type1StockAlertActivated,
+    this.type2StockAlertActivated,
   });
 
   factory Product.fromMap(Map<String, dynamic> map) => Product(
@@ -59,6 +73,7 @@ class Product {
         type2Id: map['type2_id'] as int?,
         marqueId: map['marque_id'] as int?,
         prix: map['prix'] as int?,
+        prixAchat: map['prix_achat'] as int?,
         stock: (map['stock'] as num?)?.toDouble(),
         imageUrl: map['image_url'] as String?,
         categoryName: (map['categories'] as Map?)?['name'] as String?,
@@ -69,6 +84,8 @@ class Product {
         type2Name: (map['type2'] as Map?)?['name'] as String?,
         type2ImageUrl: (map['type2'] as Map?)?['image_url'] as String?,
         marqueName: (map['marques'] as Map?)?['name'] as String?,
+        type1StockAlertActivated: (map['type1'] as Map?)?['stock_alert_activated'] as bool?,
+        type2StockAlertActivated: (map['type2'] as Map?)?['stock_alert_activated'] as bool?,
       );
 
   Map<String, dynamic> toMap() => {
@@ -79,6 +96,7 @@ class Product {
         'type2_id': type2Id,
         'marque_id': marqueId,
         'prix': prix,
+        'prix_achat': prixAchat,
         'stock': stock,
         'image_url': imageUrl,
       };
@@ -104,6 +122,11 @@ class Product {
 
   bool get isPerfume => categoryMode == 'perfume';
 
+  /// Prix - prix d'achat. Null when either side isn't tracked (e.g. perfume
+  /// products, whose sale price lives on the taille, or any product without
+  /// a cost price set yet).
+  int? get margin => (prix != null && prixAchat != null) ? prix! - prixAchat! : null;
+
   /// False for perfume products — their price is chosen per taille (bottle
   /// size) at purchase time rather than fixed on the product.
   bool get hasFixedPrice => prix != null;
@@ -124,9 +147,15 @@ class Product {
   /// False when stock isn't tracked (null) — a 'simple' product left
   /// without a stock value is never flagged as low stock. Otherwise
   /// perfume uses the 200ml threshold, everything else uses 2 units.
+  ///
+  /// Also false whenever type1 or type2 has its stock alert switched off
+  /// (see ProductType.stockAlertActivated) — e.g. a phone model the store
+  /// only ever stocks one unit of at a time, which would otherwise sit
+  /// permanently flagged.
   bool get isLowStock {
     final s = stock;
     if (s == null) return false;
+    if (type1StockAlertActivated == false || type2StockAlertActivated == false) return false;
     return s < (isPerfume ? lowStockPerfumeLiters : lowStockUnits);
   }
 }

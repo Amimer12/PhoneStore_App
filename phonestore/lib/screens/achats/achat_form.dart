@@ -381,6 +381,7 @@ class _AchatFormState extends State<AchatForm> {
           productId: l.product!.id,
           quantity: l.quantity,
           unitPrice: l.unitPrice,
+          unitCost: l.product!.prixAchat,
           type2Id: l.type2Id,
         );
       }).toList();
@@ -421,7 +422,7 @@ class _AchatFormState extends State<AchatForm> {
     final filtered = _filtered;
 
     return Scaffold(
-      appBar: AppBar(title: Text(_isEdit ? 'Modifier l\'achat' : 'Nouvel achat')),
+      appBar: AppBar(title: Text(_isEdit ? 'Modifier la vente' : 'Nouvelle vente')),
       body: Column(
         children: [
           _buildFilterBar(),
@@ -715,7 +716,7 @@ class _AchatFormState extends State<AchatForm> {
             onPressed: _saving ? null : _save,
             child: _saving
                 ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                : Text(_isEdit ? 'Enregistrer' : 'Valider l\'achat'),
+                : Text(_isEdit ? 'Enregistrer' : 'Valider la vente'),
           ),
         ],
       ),

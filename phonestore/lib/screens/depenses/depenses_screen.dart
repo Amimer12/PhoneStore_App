@@ -2,6 +2,7 @@ import 'package:intl/intl.dart';
 import 'package:flutter/material.dart';
 import '../../models/depense.dart';
 import '../../services/supabase_service.dart';
+import '../../services/permissions_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_logo.dart';
 
@@ -14,6 +15,7 @@ class DepensesScreen extends StatefulWidget {
 
 class _DepensesScreenState extends State<DepensesScreen> {
   final _service = SupabaseService.instance;
+  final _perms = PermissionsService.instance;
   List<Depense> _depenses = [];
   bool _loading = true;
 
@@ -118,18 +120,25 @@ class _DepensesScreenState extends State<DepensesScreen> {
     }
   }
 
+  Widget _detailValue(Depense d) => Text('${d.prix} DA', style: const TextStyle(fontWeight: FontWeight.bold));
+
   @override
   Widget build(BuildContext context) {
+    final canAdd = _perms.canAddDepense;
+    final canModify = _perms.canModifyDepense;
+    final canDelete = _perms.canDeleteDepense;
     return Scaffold(
       appBar: AppBar(
         leading: const Padding(padding: EdgeInsets.all(10), child: AppLogo(size: 26)),
         title: const Text('Dépenses'),
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _openForm(),
-        icon: const Icon(Icons.add),
-        label: const Text('Ajouter'),
-      ),
+      floatingActionButton: canAdd
+          ? FloatingActionButton.extended(
+              onPressed: () => _openForm(),
+              icon: const Icon(Icons.add),
+              label: const Text('Ajouter'),
+            )
+          : null,
       body: _loading
           ? const Center(child: CircularProgressIndicator(color: AppColors.gold))
           : Column(
@@ -170,14 +179,15 @@ class _DepensesScreenState extends State<DepensesScreen> {
                                   trailing: Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      Text('${d.prix} DA', style: const TextStyle(fontWeight: FontWeight.bold)),
-                                      IconButton(
-                                        icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
-                                        onPressed: () => _confirmDelete(d),
-                                      ),
+                                      _detailValue(d),
+                                      if (canDelete)
+                                        IconButton(
+                                          icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
+                                          onPressed: () => _confirmDelete(d),
+                                        ),
                                     ],
                                   ),
-                                  onTap: () => _openForm(existing: d),
+                                  onTap: canModify ? () => _openForm(existing: d) : null,
                                 ),
                               );
                             },

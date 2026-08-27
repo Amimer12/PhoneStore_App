@@ -52,6 +52,7 @@ class _ProductFormState extends State<ProductForm> {
   final _referenceCtrl = TextEditingController();
   final _nameCtrl = TextEditingController();
   final _prixCtrl = TextEditingController();
+  final _prixAchatCtrl = TextEditingController();
   final _stockCtrl = TextEditingController();
 
   Uint8List? _pickedImageBytes;
@@ -125,6 +126,7 @@ class _ProductFormState extends State<ProductForm> {
       _referenceCtrl.text = p.reference;
       _nameCtrl.text = p.name ?? '';
       _prixCtrl.text = p.prix?.toString() ?? '';
+      _prixAchatCtrl.text = p.prixAchat?.toString() ?? '';
       _stockCtrl.text = p.stock == null ? '' : (p.stock! % 1 == 0 ? p.stock!.toInt().toString() : p.stock!.toString());
       _existingImageUrl = p.imageUrl;
       _categoryId = p.categoryId;
@@ -442,6 +444,12 @@ class _ProductFormState extends State<ProductForm> {
     return double.tryParse(text) ?? (_categoryMode == CategoryMode.simple ? null : 0);
   }
 
+  int? _parsePrixAchat() {
+    final text = _prixAchatCtrl.text.trim();
+    if (text.isEmpty) return null;
+    return int.tryParse(text);
+  }
+
   // ---------------- save ----------------
 
   Future<void> _save() async {
@@ -471,6 +479,7 @@ class _ProductFormState extends State<ProductForm> {
         type2Id: _showType2 ? _type2Id : null,
         marqueId: _marqueId,
         prix: isPerfume ? null : int.parse(_prixCtrl.text.trim()),
+        prixAchat: _parsePrixAchat(),
         stock: _parseStock(),
         imageUrl: _existingImageUrl,
       );
@@ -498,6 +507,7 @@ class _ProductFormState extends State<ProductForm> {
             type2Id: product.type2Id,
             marqueId: product.marqueId,
             prix: product.prix,
+            prixAchat: product.prixAchat,
             stock: product.stock,
             imageUrl: url,
           ),
@@ -528,6 +538,7 @@ class _ProductFormState extends State<ProductForm> {
     _referenceCtrl.dispose();
     _nameCtrl.dispose();
     _prixCtrl.dispose();
+    _prixAchatCtrl.dispose();
     _stockCtrl.dispose();
     super.dispose();
   }
@@ -675,17 +686,31 @@ class _ProductFormState extends State<ProductForm> {
             if (_categoryMode == CategoryMode.simple) ...[
               const SizedBox(height: 8),
               const Text(
-                'Le prix sera modifiable à chaque vente dans le formulaire Achats.',
+                'Le prix sera modifiable à chaque vente dans le formulaire Ventes.',
                 style: TextStyle(color: AppColors.grey, fontSize: 12),
               ),
             ],
             if (_categoryMode == CategoryMode.perfume) ...[
               const SizedBox(height: 8),
               const Text(
-                'Le prix dépend de la taille de bouteille — il se choisit à la vente, dans le formulaire Achats. Ajoutez ou modifiez les tailles depuis le Catalogue.',
+                'Le prix dépend de la taille de bouteille — il se choisit à la vente, dans le formulaire Ventes. Ajoutez ou modifiez les tailles depuis le Catalogue.',
                 style: TextStyle(color: AppColors.grey, fontSize: 12),
               ),
             ],
+            const SizedBox(height: 20),
+            TextFormField(
+              controller: _prixAchatCtrl,
+              decoration: const InputDecoration(
+                labelText: "Prix d'achat (DA, optionnel)",
+              ),
+              keyboardType: TextInputType.number,
+              validator: (v) => (v != null && v.trim().isNotEmpty && int.tryParse(v.trim()) == null) ? 'Prix invalide' : null,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              "Ce que vous avez payé pour ce produit — sert à calculer le bénéfice net dans l'Analyse. Laissez vide si inconnu.",
+              style: TextStyle(color: AppColors.grey, fontSize: 12),
+            ),
             const SizedBox(height: 24),
             SizedBox(
               width: double.infinity,

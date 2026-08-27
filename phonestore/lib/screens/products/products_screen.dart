@@ -3,6 +3,7 @@ import '../../models/category.dart';
 import '../../models/product.dart';
 import '../../models/product_type.dart';
 import '../../services/supabase_service.dart';
+import '../../services/permissions_service.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/category_icons.dart';
 import 'product_form.dart';
@@ -12,44 +13,40 @@ import '../../widgets/app_logo.dart';
 import '../../services/auth_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-enum _ProductSort { defaultOrder, priceAsc, priceDesc, stockAsc, stockDesc }
+const int _kPageSize = 20;
 
-extension on _ProductSort {
+extension on ProductSort {
   String get label {
     switch (this) {
-      case _ProductSort.defaultOrder:
+      case ProductSort.defaultOrder:
         return 'Par défaut';
-      case _ProductSort.priceAsc:
+      case ProductSort.priceAsc:
         return 'Prix (bas → élevé)';
-      case _ProductSort.priceDesc:
+      case ProductSort.priceDesc:
         return 'Prix (élevé → bas)';
-      case _ProductSort.stockAsc:
+      case ProductSort.stockAsc:
         return 'Stock (bas → élevé)';
-      case _ProductSort.stockDesc:
+      case ProductSort.stockDesc:
         return 'Stock (élevé → bas)';
     }
   }
 
   IconData get icon {
     switch (this) {
-      case _ProductSort.defaultOrder:
+      case ProductSort.defaultOrder:
         return Icons.sort;
-      case _ProductSort.priceAsc:
-      case _ProductSort.priceDesc:
+      case ProductSort.priceAsc:
+      case ProductSort.priceDesc:
         return Icons.sell_outlined;
-      case _ProductSort.stockAsc:
-      case _ProductSort.stockDesc:
+      case ProductSort.stockAsc:
+      case ProductSort.stockDesc:
         return Icons.inventory_2_outlined;
     }
   }
 }
 
 class ProductsScreen extends StatefulWidget {
-  /// Workers get a read-only version of this screen: no "Ajouter" FAB, no
-  /// catalog management, no delete, and tapping a product shows details
-  /// instead of opening the edit form.
-  final bool isAdmin;
-  const ProductsScreen({super.key, this.isAdmin = true});
+  const ProductsScreen({super.key});
 
   @override
   State<ProductsScreen> createState() => _ProductsScreenState();
@@ -57,16 +54,25 @@ class ProductsScreen extends StatefulWidget {
 
 class _ProductsScreenState extends State<ProductsScreen> {
   final _service = SupabaseService.instance;
-  bool get _isAdmin => widget.isAdmin;
+  final _perms = PermissionsService.instance;
+
+  bool get _isAdmin => AuthService.instance.currentRole == AppRole.admin;
 
   List<Category> _categories = [];
   List<ProductType> _type1Options = [];
-  List<Product> _allProducts = [];
+
+  /// Every product page fetched so far for the current filter/sort, in
+  /// server order — NOT re-sorted client-side (see [ProductSort]), so this
+  /// stays correct as more pages are appended.
+  List<Product> _products = [];
+  int _nextPage = 0;
+  bool _hasMore = true;
+  bool _loadingMore = false;
 
   int? _selectedCategoryId;
   int? _selectedType1Id;
   String _search = '';
-  _ProductSort _sort = _ProductSort.defaultOrder;
+  ProductSort _sort = ProductSort.defaultOrder;
   bool _loading = true;
   String? _error;
 
@@ -78,10 +84,10 @@ class _ProductsScreenState extends State<ProductsScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+    _init();
   }
 
-  Future<void> _load() async {
+  Future<void> _init() async {
     setState(() {
       _loading = true;
       _error = null;
@@ -90,47 +96,63 @@ class _ProductsScreenState extends State<ProductsScreen> {
       _categories = await _service.getCategories();
       if (_selectedCategoryId != null && !_selectedIsPerfume) {
         _type1Options = await _service.getTypes(categoryId: _selectedCategoryId, topLevelOnly: true, level: 1);
-      } else {
-        _type1Options = [];
       }
-      _allProducts = await _service.getProducts(
-        categoryId: _selectedCategoryId,
-        type1Id: _selectedType1Id,
-      );
+      await _resetAndLoad();
     } catch (e) {
       // Common cause: RLS requires an authenticated session and none exists yet,
       // or the Supabase URL/anon key in main.dart aren't set correctly.
-      _error = e.toString();
+      setState(() => _error = e.toString());
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
-  /// Search matches the product's reference OR its type/marque/category
-  /// names — done client-side since the catalog is small and this avoids a
-  /// more complex joined-column search query against Postgrest.
-  List<Product> get _filtered {
-    var list = _search.trim().isEmpty
-        ? List<Product>.from(_allProducts)
-        : _allProducts.where((p) => p.searchBlob.contains(_search.trim().toLowerCase())).toList();
+  /// Clears the current chunk of loaded products and re-fetches page 0 —
+  /// called whenever the category/type filter or the sort changes, since
+  /// both change what "page 0" even means.
+  Future<void> _resetAndLoad() async {
+    setState(() {
+      _products = [];
+      _nextPage = 0;
+      _hasMore = true;
+      _error = null;
+    });
+    await _loadNextPage();
+  }
 
-    switch (_sort) {
-      case _ProductSort.defaultOrder:
-        break;
-      case _ProductSort.priceAsc:
-        list.sort((a, b) => (a.prix ?? 0).compareTo(b.prix ?? 0));
-        break;
-      case _ProductSort.priceDesc:
-        list.sort((a, b) => (b.prix ?? 0).compareTo(a.prix ?? 0));
-        break;
-      case _ProductSort.stockAsc:
-        list.sort((a, b) => (a.stock ?? 0).compareTo(b.stock ?? 0));
-        break;
-      case _ProductSort.stockDesc:
-        list.sort((a, b) => (b.stock ?? 0).compareTo(a.stock ?? 0));
-        break;
+  Future<void> _loadNextPage() async {
+    if (_loadingMore || !_hasMore) return;
+    setState(() => _loadingMore = true);
+    try {
+      final result = await _service.getProductsPage(
+        categoryId: _selectedCategoryId,
+        type1Id: _selectedType1Id,
+        page: _nextPage,
+        pageSize: _kPageSize,
+        sort: _sort,
+      );
+      if (!mounted) return;
+      setState(() {
+        _products = [..._products, ...result.products];
+        _hasMore = result.hasMore;
+        _nextPage++;
+      });
+    } catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loadingMore = false);
     }
-    return list;
+  }
+
+  /// Search matches the product's reference OR its type/marque/category
+  /// names, applied only to the chunk already loaded on the device — this
+  /// is a client-side narrowing of what's on screen, not a catalog-wide
+  /// search, since products are now fetched a page at a time. If what
+  /// you're looking for isn't showing up, "Voir plus" loads the next chunk.
+  List<Product> get _filtered {
+    if (_search.trim().isEmpty) return _products;
+    final q = _search.trim().toLowerCase();
+    return _products.where((p) => p.searchBlob.contains(q)).toList();
   }
 
   Future<void> _onCategoryChanged(int? id) async {
@@ -139,24 +161,35 @@ class _ProductsScreenState extends State<ProductsScreen> {
       _selectedType1Id = null;
       _type1Options = [];
     });
-    await _load();
+    if (id != null && !_selectedIsPerfume) {
+      _type1Options = await _service.getTypes(categoryId: id, topLevelOnly: true, level: 1);
+      if (mounted) setState(() {});
+    }
+    await _resetAndLoad();
   }
 
   Future<void> _onType1Changed(int? id) async {
     setState(() => _selectedType1Id = id);
-    await _load();
+    await _resetAndLoad();
   }
 
   Future<void> _openForm({Product? product}) async {
+    Product? full = product;
+    if (product != null) {
+      // The list only carries the lightweight projection (no prix_achat) —
+      // fetch the full row before handing it to the edit form.
+      full = await _service.getProductById(product.id);
+    }
+    if (!mounted) return;
     final saved = await Navigator.of(context).push<bool>(
-      MaterialPageRoute(builder: (_) => ProductForm(product: product)),
+      MaterialPageRoute(builder: (_) => ProductForm(product: full)),
     );
-    if (saved == true) _load();
+    if (saved == true) await _resetAndLoad();
   }
 
   /// Workers can look up a product's full details, they just can't change
   /// anything — this stays a plain read-only dialog rather than opening the
-  /// real edit form (product_form.dart is admin-only).
+  /// real edit form (product_form.dart is for canModifyProduct only).
   void _showReadOnlyDetails(Product p) {
     showDialog(
       context: context,
@@ -210,11 +243,11 @@ class _ProductsScreenState extends State<ProductsScreen> {
     if (ok == true) {
       try {
         await _service.deleteProduct(p.id);
-        _load();
+        await _resetAndLoad();
       } on PostgrestException catch (e) {
         if (!mounted) return;
         final message = e.code == '23503'
-            ? 'Ce produit a des achats enregistrés et ne peut pas être supprimé.'
+            ? 'Ce produit a des ventes enregistrées et ne peut pas être supprimé.'
             : 'Erreur Supabase (${e.code ?? '?'}): ${e.message}';
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
       } catch (e) {
@@ -227,18 +260,26 @@ class _ProductsScreenState extends State<ProductsScreen> {
   }
 
   Future<void> _openSort() async {
-    final chosen = await showModalBottomSheet<_ProductSort>(
+    final chosen = await showModalBottomSheet<ProductSort>(
       context: context,
       backgroundColor: Colors.transparent,
       builder: (_) => _ProductSortSheet(current: _sort),
     );
-    if (chosen != null) setState(() => _sort = chosen);
+    if (chosen != null && chosen != _sort) {
+      setState(() => _sort = chosen);
+      await _resetAndLoad();
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final products = _filtered;
-    final lowStockCount = _allProducts.where((p) => p.isLowStock).length;
+    final lowStockCount = _products.where((p) => p.isLowStock).length;
+    final canAdd = _perms.canAddProduct;
+    final canModify = _perms.canModifyProduct;
+    final canDelete = _perms.canDeleteProduct;
+    final canViewCatalog = _perms.canViewCatalog;
+
     return Scaffold(
       appBar: AppBar(
         leading: const Padding(padding: EdgeInsets.all(10), child: AppLogo(size: 26)),
@@ -249,7 +290,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
             tooltip: 'Trier',
             onPressed: _openSort,
           ),
-          if (_isAdmin)
+          if (canViewCatalog)
             IconButton(
               icon: const Icon(Icons.category_outlined),
               tooltip: 'Gérer catégories / types / marques',
@@ -257,7 +298,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
                 await Navigator.of(context).push(
                   MaterialPageRoute(builder: (_) => const CatalogScreen()),
                 );
-                _load();
+                await _resetAndLoad();
               },
             ),
           IconButton(
@@ -267,7 +308,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
           ),
         ],
       ),
-      floatingActionButton: _isAdmin
+      floatingActionButton: canAdd
           ? FloatingActionButton.extended(
               onPressed: () => _openForm(),
               icon: const Icon(Icons.add),
@@ -288,12 +329,12 @@ class _ProductsScreenState extends State<ProductsScreen> {
             ),
           ),
           _buildFilters(),
-          if (_sort != _ProductSort.defaultOrder || lowStockCount > 0)
+          if (_sort != ProductSort.defaultOrder || lowStockCount > 0)
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
               child: Row(
                 children: [
-                  if (_sort != _ProductSort.defaultOrder) ...[
+                  if (_sort != ProductSort.defaultOrder) ...[
                     Icon(_sort.icon, size: 13, color: AppColors.gold),
                     const SizedBox(width: 5),
                     Text(_sort.label, style: const TextStyle(color: AppColors.grey, fontSize: 12, fontWeight: FontWeight.w500)),
@@ -328,7 +369,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
                               const SizedBox(height: 12),
                               Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: AppColors.grey)),
                               const SizedBox(height: 16),
-                              ElevatedButton(onPressed: _load, child: const Text('Réessayer')),
+                              ElevatedButton(onPressed: _resetAndLoad, child: const Text('Réessayer')),
                             ],
                           ),
                         ),
@@ -336,17 +377,28 @@ class _ProductsScreenState extends State<ProductsScreen> {
                     : products.isEmpty
                     ? const Center(child: Text('Aucun produit', style: TextStyle(color: AppColors.grey)))
                     : RefreshIndicator(
-                        onRefresh: _load,
+                        onRefresh: _resetAndLoad,
                         color: AppColors.gold,
                         child: ListView.separated(
                           padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
-                          itemCount: products.length,
+                          // +1 for the trailing "Voir plus" row, shown only
+                          // when there's another page AND no client-side
+                          // search is currently narrowing the loaded chunk
+                          // (loading more while a search is active would
+                          // silently append products that don't match it).
+                          itemCount: products.length + (_hasMore && _search.trim().isEmpty ? 1 : 0),
                           separatorBuilder: (_, __) => const SizedBox(height: 10),
-                          itemBuilder: (_, i) => _ProductCard(
-                            product: products[i],
-                            onTap: () => _isAdmin ? _openForm(product: products[i]) : _showReadOnlyDetails(products[i]),
-                            onDelete: _isAdmin ? () => _confirmDelete(products[i]) : null,
-                          ),
+                          itemBuilder: (_, i) {
+                            if (i >= products.length) {
+                              return _VoirPlusButton(loading: _loadingMore, onTap: _loadNextPage);
+                            }
+                            final p = products[i];
+                            return _ProductCard(
+                              product: p,
+                              onTap: () => canModify ? _openForm(product: p) : _showReadOnlyDetails(p),
+                              onDelete: canDelete ? () => _confirmDelete(p) : null,
+                            );
+                          },
                         ),
                       ),
           ),
@@ -383,13 +435,41 @@ class _ProductsScreenState extends State<ProductsScreen> {
   }
 }
 
+/// The "slide down, then tap to load 10/20 more" control the products list
+/// now ends on instead of loading the entire category up front.
+class _VoirPlusButton extends StatelessWidget {
+  final bool loading;
+  final VoidCallback onTap;
+  const _VoirPlusButton({required this.loading, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Center(
+        child: OutlinedButton.icon(
+          onPressed: loading ? null : onTap,
+          icon: loading
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.gold),
+                )
+              : const Icon(Icons.expand_more, size: 18),
+          label: Text(loading ? 'Chargement...' : 'Voir plus'),
+        ),
+      ),
+    );
+  }
+}
+
 class _ProductSortSheet extends StatelessWidget {
-  final _ProductSort current;
+  final ProductSort current;
   const _ProductSortSheet({required this.current});
 
   @override
   Widget build(BuildContext context) {
-    Widget tile(_ProductSort s) {
+    Widget tile(ProductSort s) {
       final selected = s == current;
       return ListTile(
         leading: Icon(s.icon, color: selected ? AppColors.gold : AppColors.grey),
@@ -420,11 +500,11 @@ class _ProductSortSheet extends StatelessWidget {
             ),
             const Text('Trier par', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
             const SizedBox(height: 6),
-            tile(_ProductSort.defaultOrder),
-            tile(_ProductSort.priceAsc),
-            tile(_ProductSort.priceDesc),
-            tile(_ProductSort.stockAsc),
-            tile(_ProductSort.stockDesc),
+            tile(ProductSort.defaultOrder),
+            tile(ProductSort.priceAsc),
+            tile(ProductSort.priceDesc),
+            tile(ProductSort.stockAsc),
+            tile(ProductSort.stockDesc),
           ],
         ),
       ),

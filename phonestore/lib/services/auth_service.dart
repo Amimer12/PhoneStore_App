@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'permissions_service.dart';
 
 /// The two actors in the app. Neither has a real email/password account —
 /// both are Supabase Anonymous Sign-In sessions, distinguished only by the
@@ -43,6 +44,11 @@ class AuthService {
         await _c.auth.signOut();
         roleNotifier.value = null;
       } else {
+        // Load the worker-permissions snapshot before flipping roleNotifier
+        // so HomeShell never renders a first frame with stale (default)
+        // permissions — matters most for a worker device that reopens the
+        // app after the admin changed something.
+        await PermissionsService.instance.load();
         roleNotifier.value = role;
       }
     } finally {
@@ -71,6 +77,7 @@ class AuthService {
   Future<void> continueAsWorker() async {
     await _ensureSession();
     await _c.rpc('claim_worker');
+    await PermissionsService.instance.load();
     roleNotifier.value = AppRole.worker;
   }
 
@@ -84,7 +91,10 @@ class AuthService {
   Future<bool> loginAsAdmin(String password) async {
     await _ensureSession();
     final ok = await _c.rpc('claim_admin', params: {'p_password': password}) as bool;
-    if (ok) roleNotifier.value = AppRole.admin;
+    if (ok) {
+      await PermissionsService.instance.load();
+      roleNotifier.value = AppRole.admin;
+    }
     return ok;
   }
 

@@ -10,6 +10,10 @@ class AchatItem {
   final int quantity;
   final int unitPrice;
 
+  /// Snapshot of the product's prix_achat at the moment of sale. Null for
+  /// repair/service lines, and for sales made before cost tracking existed.
+  final int? unitCost;
+
   /// The bottle size (product_types row) chosen for this line — only set
   /// for products whose category is in 'perfume' mode. Null for everything
   /// else.
@@ -39,6 +43,7 @@ class AchatItem {
     this.productId,
     required this.quantity,
     required this.unitPrice,
+    this.unitCost,
     this.type2Id,
     this.type2Name,
     this.categoryId,
@@ -50,6 +55,11 @@ class AchatItem {
 
   int get subtotal => quantity * unitPrice;
 
+  /// Null when unitCost isn't known (repair line, or sold before cost
+  /// tracking existed) — distinct from 0, which would wrongly imply "free".
+  int? get costSubtotal => unitCost != null ? quantity * unitCost! : null;
+  int? get profitSubtotal => unitCost != null ? subtotal - costSubtotal! : null;
+
   /// True for a 'repair' combo line — no product backs this line.
   bool get isRepair => productId == null;
 
@@ -59,6 +69,7 @@ class AchatItem {
         productId: map['product_id'] as int?,
         quantity: map['quantity'] as int,
         unitPrice: map['unit_price'] as int,
+        unitCost: map['unit_cost'] as int?,
         type2Id: map['type2_id'] as int?,
         type2Name: (map['taille'] as Map?)?['name'] as String?,
         categoryId: map['category_id'] as int?,
@@ -77,6 +88,7 @@ class AchatItem {
         'product_id': productId,
         'quantity': quantity,
         'unit_price': unitPrice,
+        'unit_cost': unitCost,
         'type2_id': type2Id,
         'category_id': categoryId,
         'label': label,
@@ -87,14 +99,25 @@ class Achat {
   final int? id;
   final DateTime date;
   final int totalPrice;
+  final int totalCost;
+  final int totalProfit;
   final List<AchatItem> items;
 
-  Achat({this.id, required this.date, this.totalPrice = 0, this.items = const []});
+  Achat({
+    this.id,
+    required this.date,
+    this.totalPrice = 0,
+    this.totalCost = 0,
+    this.totalProfit = 0,
+    this.items = const [],
+  });
 
   factory Achat.fromMap(Map<String, dynamic> map) => Achat(
         id: map['id'] as int?,
         date: DateTime.parse(map['achat_date'] as String),
         totalPrice: map['total_price'] as int? ?? 0,
+        totalCost: map['total_cost'] as int? ?? 0,
+        totalProfit: map['total_profit'] as int? ?? map['total_price'] as int? ?? 0,
         items: (map['achat_items'] as List<dynamic>?)
                 ?.map((e) => AchatItem.fromMap(e as Map<String, dynamic>))
                 .toList() ??

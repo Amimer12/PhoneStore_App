@@ -5,6 +5,7 @@ import '../../models/category.dart';
 import '../../models/marque.dart';
 import '../../models/product_type.dart';
 import '../../services/supabase_service.dart';
+import '../../services/permissions_service.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/category_icons.dart';
 import 'product_form.dart' show pickCompressedImage;
@@ -62,6 +63,7 @@ class _CategoriesTab extends StatefulWidget {
 
 class _CategoriesTabState extends State<_CategoriesTab> {
   final _service = SupabaseService.instance;
+  final _perms = PermissionsService.instance;
   List<Category> _items = [];
   bool _loading = true;
 
@@ -141,7 +143,9 @@ class _CategoriesTabState extends State<_CategoriesTab> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      floatingActionButton: FloatingActionButton(onPressed: () => _openDialog(), child: const Icon(Icons.add)),
+      floatingActionButton: _perms.canAddCatalog
+          ? FloatingActionButton(onPressed: () => _openDialog(), child: const Icon(Icons.add))
+          : null,
       body: _loading
           ? const Center(child: CircularProgressIndicator(color: AppColors.gold))
           : ListView.builder(
@@ -158,22 +162,24 @@ class _CategoriesTabState extends State<_CategoriesTab> {
                     ),
                     title: Text(c.name),
                     subtitle: Text(_modeLabel(c.mode), style: const TextStyle(fontSize: 11, color: AppColors.grey)),
-                    onTap: () => _openDialog(existing: c),
-                    trailing: IconButton(
-                      icon: const Icon(Icons.delete_outline, color: AppColors.danger),
-                      onPressed: () async {
-                        try {
-                          await _service.deleteCategory(c.id);
-                          _load();
-                        } on PostgrestException catch (e) {
-                          if (!context.mounted) return;
-                          final message = e.code == '23503'
-                              ? 'Cette catégorie contient encore des types ou des produits — supprimez-les d\'abord.'
-                              : 'Erreur Supabase (${e.code ?? '?'}): ${e.message}';
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
-                        }
-                      },
-                    ),
+                    onTap: _perms.canModifyCatalog ? () => _openDialog(existing: c) : null,
+                    trailing: _perms.canDeleteCatalog
+                        ? IconButton(
+                            icon: const Icon(Icons.delete_outline, color: AppColors.danger),
+                            onPressed: () async {
+                              try {
+                                await _service.deleteCategory(c.id);
+                                _load();
+                              } on PostgrestException catch (e) {
+                                if (!context.mounted) return;
+                                final message = e.code == '23503'
+                                    ? 'Cette catégorie contient encore des types ou des produits — supprimez-les d\'abord.'
+                                    : 'Erreur Supabase (${e.code ?? '?'}): ${e.message}';
+                                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+                              }
+                            },
+                          )
+                        : null,
                   ),
                 );
               },
@@ -210,6 +216,7 @@ class _TypesTab extends StatefulWidget {
 
 class _TypesTabState extends State<_TypesTab> {
   final _service = SupabaseService.instance;
+  final _perms = PermissionsService.instance;
   List<Category> _categories = [];
   int? _categoryId;
 
@@ -309,7 +316,7 @@ class _TypesTabState extends State<_TypesTab> {
     } on PostgrestException catch (e) {
       if (!mounted) return;
       final message = e.code == '23503'
-          ? 'Ce type est encore utilisé par des produits ou des achats — impossible à supprimer.'
+          ? 'Ce type est encore utilisé par des produits ou des ventes — impossible à supprimer.'
           : 'Erreur Supabase (${e.code ?? '?'}): ${e.message}';
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
     }
@@ -321,6 +328,7 @@ class _TypesTabState extends State<_TypesTab> {
     final nameCtrl = TextEditingController(text: existing?.name ?? '');
     Uint8List? picked;
     final level = _path.length + 1;
+    bool stockAlertActivated = existing?.stockAlertActivated ?? true;
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -340,6 +348,19 @@ class _TypesTabState extends State<_TypesTab> {
               const Text('Photo optionnelle', style: TextStyle(color: AppColors.grey, fontSize: 11)),
               const SizedBox(height: 12),
               TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Nom')),
+              const SizedBox(height: 8),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Alerte stock faible', style: TextStyle(fontSize: 13.5)),
+                subtitle: const Text(
+                  "À désactiver pour un type dont le magasin ne reçoit qu'un seul exemplaire "
+                  "à la fois, pour éviter un avertissement permanent.",
+                  style: TextStyle(fontSize: 11, color: AppColors.grey),
+                ),
+                value: stockAlertActivated,
+                activeColor: AppColors.gold,
+                onChanged: (v) => setSt(() => stockAlertActivated = v),
+              ),
             ],
           ),
           actions: [
@@ -355,6 +376,7 @@ class _TypesTabState extends State<_TypesTab> {
                   name: nameCtrl.text.trim(),
                   imageUrl: existing?.imageUrl,
                   level: level,
+                  stockAlertActivated: stockAlertActivated,
                 );
                 if (picked != null) {
                   final url = await _service.uploadImage(folder: 'product-types', fileName: '$id.jpg', bytes: picked!);
@@ -365,6 +387,7 @@ class _TypesTabState extends State<_TypesTab> {
                     name: nameCtrl.text.trim(),
                     imageUrl: url,
                     level: level,
+                    stockAlertActivated: stockAlertActivated,
                   );
                 }
                 if (ctx.mounted) Navigator.pop(ctx);
@@ -388,52 +411,68 @@ class _TypesTabState extends State<_TypesTab> {
       text: existing?.volumeLiters != null ? (existing!.volumeLiters! * 1000).round().toString() : '',
     );
     final prixCtrl = TextEditingController(text: existing?.prix?.toString() ?? '');
+    bool stockAlertActivated = existing?.stockAlertActivated ?? true;
     await showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(existing == null ? 'Nouvelle taille' : 'Modifier la taille'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: volumeCtrl,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(labelText: 'Taille (ml) *'),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: prixCtrl,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Prix (DA) *'),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSt) => AlertDialog(
+          title: Text(existing == null ? 'Nouvelle taille' : 'Modifier la taille'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: volumeCtrl,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: const InputDecoration(labelText: 'Taille (ml) *'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: prixCtrl,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'Prix (DA) *'),
+              ),
+              const SizedBox(height: 8),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Alerte stock faible', style: TextStyle(fontSize: 13.5)),
+                subtitle: const Text(
+                  "À désactiver si le magasin ne reçoit qu'un seul flacon de cette taille à la fois.",
+                  style: TextStyle(fontSize: 11, color: AppColors.grey),
+                ),
+                value: stockAlertActivated,
+                activeColor: AppColors.gold,
+                onChanged: (v) => setSt(() => stockAlertActivated = v),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
+            ElevatedButton(
+              onPressed: () async {
+                if (_categoryId == null) return;
+                final ml = double.tryParse(volumeCtrl.text.trim().replaceAll(',', '.'));
+                final prix = int.tryParse(prixCtrl.text.trim());
+                if (ml == null || ml <= 0 || prix == null || prix < 0) return;
+                final volume = ml / 1000;
+                final name = volume < 1 ? '${ml.round()}ml' : (volume % 1 == 0 ? '${volume.toInt()}L' : '${volume.toStringAsFixed(2)}L');
+                await _service.upsertType(
+                  id: existing?.id,
+                  categoryId: _categoryId!,
+                  parentId: null,
+                  name: name,
+                  imageUrl: existing?.imageUrl,
+                  level: 2,
+                  volumeLiters: volume,
+                  prix: prix,
+                  stockAlertActivated: stockAlertActivated,
+                );
+                if (ctx.mounted) Navigator.pop(ctx);
+                _reloadPerfumeLists();
+              },
+              child: const Text('Enregistrer'),
             ),
           ],
         ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Annuler')),
-          ElevatedButton(
-            onPressed: () async {
-              if (_categoryId == null) return;
-              final ml = double.tryParse(volumeCtrl.text.trim().replaceAll(',', '.'));
-              final prix = int.tryParse(prixCtrl.text.trim());
-              if (ml == null || ml <= 0 || prix == null || prix < 0) return;
-              final volume = ml / 1000;
-              final name = volume < 1 ? '${ml.round()}ml' : (volume % 1 == 0 ? '${volume.toInt()}L' : '${volume.toStringAsFixed(2)}L');
-              await _service.upsertType(
-                id: existing?.id,
-                categoryId: _categoryId!,
-                parentId: null,
-                name: name,
-                imageUrl: existing?.imageUrl,
-                level: 2,
-                volumeLiters: volume,
-                prix: prix,
-              );
-              if (ctx.mounted) Navigator.pop(ctx);
-              _reloadPerfumeLists();
-            },
-            child: const Text('Enregistrer'),
-          ),
-        ],
       ),
     );
   }
@@ -443,7 +482,7 @@ class _TypesTabState extends State<_TypesTab> {
     if (_loading) return const Center(child: CircularProgressIndicator(color: AppColors.gold));
     final mode = _mode;
     return Scaffold(
-      floatingActionButton: (_categoryId == null || mode == CategoryMode.perfume)
+      floatingActionButton: (_categoryId == null || mode == CategoryMode.perfume || !_perms.canAddCatalog)
           ? null
           : FloatingActionButton(
               onPressed: () => _openDialog(),
@@ -521,21 +560,24 @@ class _TypesTabState extends State<_TypesTab> {
             itemBuilder: (_, i) {
               final t = _current[i];
               final canDrill = mode != CategoryMode.simple && mode != CategoryMode.repair && _path.length < 1;
+              final canModify = _perms.canModifyCatalog;
               return Card(
                 margin: const EdgeInsets.only(bottom: 8),
                 child: ListTile(
                   leading: _typeThumb(t.imageUrl, null),
                   title: Text(t.name),
                   subtitle: Text('niveau ${t.level}', style: const TextStyle(fontSize: 11, color: AppColors.grey)),
-                  onTap: canDrill ? () => _drillInto(t) : () => _openDialog(existing: t),
+                  onTap: canDrill ? () => _drillInto(t) : (canModify ? () => _openDialog(existing: t) : null),
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      IconButton(icon: const Icon(Icons.edit_outlined, size: 20), onPressed: () => _openDialog(existing: t)),
-                      IconButton(
-                        icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
-                        onPressed: () => _deleteType(t),
-                      ),
+                      if (canModify)
+                        IconButton(icon: const Icon(Icons.edit_outlined, size: 20), onPressed: () => _openDialog(existing: t)),
+                      if (_perms.canDeleteCatalog)
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
+                          onPressed: () => _deleteType(t),
+                        ),
                     ],
                   ),
                 ),
@@ -553,33 +595,38 @@ class _TypesTabState extends State<_TypesTab> {
           child: Row(
             children: [
               Expanded(child: Text(title, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14))),
-              IconButton(icon: const Icon(Icons.add_circle, color: AppColors.gold), onPressed: onAdd),
+              if (_perms.canAddCatalog) IconButton(icon: const Icon(Icons.add_circle, color: AppColors.gold), onPressed: onAdd),
             ],
           ),
         );
 
-    Widget tailleTile(ProductType t) => Card(
-          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-          child: ListTile(
-            leading: const CircleAvatar(
-              backgroundColor: AppColors.offWhite,
-              child: Icon(Icons.opacity_outlined, color: AppColors.black, size: 18),
-            ),
-            title: Text(t.volumeLabel),
-            subtitle: Text(t.priceLabel ?? 'Prix non défini', style: const TextStyle(fontSize: 11, color: AppColors.grey)),
-            onTap: () => _openTailleDialog(existing: t),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
+    Widget tailleTile(ProductType t) {
+      final canModify = _perms.canModifyCatalog;
+      return Card(
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        child: ListTile(
+          leading: const CircleAvatar(
+            backgroundColor: AppColors.offWhite,
+            child: Icon(Icons.opacity_outlined, color: AppColors.black, size: 18),
+          ),
+          title: Text(t.volumeLabel),
+          subtitle: Text(t.priceLabel ?? 'Prix non défini', style: const TextStyle(fontSize: 11, color: AppColors.grey)),
+          onTap: canModify ? () => _openTailleDialog(existing: t) : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (canModify)
                 IconButton(icon: const Icon(Icons.edit_outlined, size: 20), onPressed: () => _openTailleDialog(existing: t)),
+              if (_perms.canDeleteCatalog)
                 IconButton(
                   icon: const Icon(Icons.delete_outline, color: AppColors.danger, size: 20),
                   onPressed: () => _deleteType(t),
                 ),
-              ],
-            ),
+            ],
           ),
-        );
+        ),
+      );
+    }
 
     return ListView(
       children: [
@@ -614,6 +661,7 @@ class _MarquesTab extends StatefulWidget {
 
 class _MarquesTabState extends State<_MarquesTab> {
   final _service = SupabaseService.instance;
+  final _perms = PermissionsService.instance;
   List<Marque> _items = [];
   bool _loading = true;
 
@@ -698,7 +746,9 @@ class _MarquesTabState extends State<_MarquesTab> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      floatingActionButton: FloatingActionButton(onPressed: () => _openDialog(), child: const Icon(Icons.add)),
+      floatingActionButton: _perms.canAddCatalog
+          ? FloatingActionButton(onPressed: () => _openDialog(), child: const Icon(Icons.add))
+          : null,
       body: _loading
           ? const Center(child: CircularProgressIndicator(color: AppColors.gold))
           : ListView.builder(
@@ -718,22 +768,24 @@ class _MarquesTabState extends State<_MarquesTab> {
                       m.type == MarqueType.perfum ? 'Marque parfum' : 'Marque tech',
                       style: const TextStyle(fontSize: 11, color: AppColors.grey),
                     ),
-                    onTap: () => _openDialog(existing: m),
-                    trailing: IconButton(
-                      icon: const Icon(Icons.delete_outline, color: AppColors.danger),
-                      onPressed: () async {
-                        try {
-                          await _service.deleteMarque(m.id);
-                          _load();
-                        } on PostgrestException catch (e) {
-                          if (!context.mounted) return;
-                          final message = e.code == '23503'
-                              ? 'Cette marque est encore utilisée par des produits — impossible à supprimer.'
-                              : 'Erreur Supabase (${e.code ?? '?'}): ${e.message}';
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
-                        }
-                      },
-                    ),
+                    onTap: _perms.canModifyCatalog ? () => _openDialog(existing: m) : null,
+                    trailing: _perms.canDeleteCatalog
+                        ? IconButton(
+                            icon: const Icon(Icons.delete_outline, color: AppColors.danger),
+                            onPressed: () async {
+                              try {
+                                await _service.deleteMarque(m.id);
+                                _load();
+                              } on PostgrestException catch (e) {
+                                if (!context.mounted) return;
+                                final message = e.code == '23503'
+                                    ? 'Cette marque est encore utilisée par des produits — impossible à supprimer.'
+                                    : 'Erreur Supabase (${e.code ?? '?'}): ${e.message}';
+                                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+                              }
+                            },
+                          )
+                        : null,
                   ),
                 );
               },

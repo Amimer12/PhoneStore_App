@@ -105,7 +105,7 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      _sectionTitle('Revenu par jour'),
+                      _sectionTitle('Bénéfice par jour'),
                       _SegmentedToggle(
                         options: const ['Quotidien', 'Cumulé'],
                         selectedIndex: _cumulative ? 1 : 0,
@@ -125,10 +125,10 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
                     children: [
                       _sectionTitle('Top produits'),
                       _SegmentedToggle(
-                        options: const ['Qté vendue', "Chiffre d'affaires"],
+                        options: const ['Qté vendue', 'Bénéfice'],
                         selectedIndex: _topMetric == TopProductsMetric.quantity ? 0 : 1,
                         onSelect: (i) {
-                          setState(() => _topMetric = i == 0 ? TopProductsMetric.quantity : TopProductsMetric.revenue);
+                          setState(() => _topMetric = i == 0 ? TopProductsMetric.quantity : TopProductsMetric.profit);
                           _loadTopLists().then((_) => setState(() {}));
                         },
                       ),
@@ -143,7 +143,7 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
                     _buildTopList(_topRepairs, isProduct: false),
                   ],
                   const SizedBox(height: 28),
-                  _sectionTitle('Revenu par catégorie'),
+                  _sectionTitle('Bénéfice par catégorie'),
                   const SizedBox(height: 12),
                   _buildCategoryPie(),
                 ],
@@ -171,17 +171,17 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
       children: [
         Row(
           children: [
-            Expanded(child: _kpiCard("Achats aujourd'hui", '$achatsToday DA')),
+            Expanded(child: _kpiCard("Chiffre d'affaires (jour)", '$achatsToday DA')),
             const SizedBox(width: 12),
-            Expanded(child: _kpiCard("Ventes aujourd'hui", '$achatsTodayCount')),
+            Expanded(child: _kpiCard("Nombre de ventes (jour)", '$achatsTodayCount')),
           ],
         ),
         const SizedBox(height: 12),
         Row(
           children: [
-            Expanded(child: _kpiCard('Achats ce mois', '$achatsMonth DA', trend: growth)),
+            Expanded(child: _kpiCard("Chiffre d'affaires (mois)", '$achatsMonth DA', trend: growth)),
             const SizedBox(width: 12),
-            Expanded(child: _kpiCard('Ventes ce mois', '$achatsMonthCount')),
+            Expanded(child: _kpiCard('Nombre de ventes (mois)', '$achatsMonthCount')),
           ],
         ),
         const SizedBox(height: 12),
@@ -229,15 +229,20 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
 
     final spots = <FlSpot>[];
     double running = 0;
-    double maxRevenue = 0;
+    double maxProfit = 0;
+    double minProfit = 0;
     for (var i = 0; i < _daily.length; i++) {
-      final raw = (_daily[i]['revenue'] as num?)?.toDouble() ?? 0;
+      final raw = (_daily[i]['profit'] as num?)?.toDouble() ?? 0;
       running += raw;
       final y = _cumulative ? running : raw;
       spots.add(FlSpot(i.toDouble(), y));
-      if (y > maxRevenue) maxRevenue = y;
+      if (y > maxProfit) maxProfit = y;
+      if (y < minProfit) minProfit = y;
     }
-    final topY = maxRevenue <= 0 ? 10.0 : maxRevenue * 1.15;
+    final topY = maxProfit <= 0 ? 10.0 : maxProfit * 1.15;
+    // Profit (unlike revenue) can go negative on a day where cost exceeded
+    // what was sold — unlike the old revenue chart, minY can't be pinned to 0.
+    final bottomY = minProfit >= 0 ? 0.0 : minProfit * 1.15;
 
     String dayLabel(int index) {
       if (index < 0 || index >= _daily.length) return '';
@@ -256,7 +261,7 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
       decoration: BoxDecoration(color: AppColors.white, borderRadius: BorderRadius.circular(18)),
       child: LineChart(
         LineChartData(
-          minY: 0,
+          minY: bottomY,
           maxY: topY,
           minX: 0,
           maxX: (_daily.length - 1).toDouble().clamp(0, double.infinity),
@@ -343,9 +348,9 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
                 final row = _hourly[group.x.toInt()];
                 final hour = _asInt(row['hour']);
                 final count = _asInt(row['nb_achats']);
-                final revenue = _asInt(row['revenue']);
+                final profit = _asInt(row['profit']);
                 return BarTooltipItem(
-                  '${hour.toString().padLeft(2, '0')}h\n$count vente${count == 1 ? '' : 's'}\n$revenue DA',
+                  '${hour.toString().padLeft(2, '0')}h\n$count vente${count == 1 ? '' : 's'}\n$profit DA',
                   const TextStyle(color: AppColors.gold, fontWeight: FontWeight.bold, fontSize: 12),
                 );
               },
@@ -426,7 +431,7 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
       return _EmptyChartBox(text: isProduct ? 'Aucune vente enregistrée' : 'Aucune réparation enregistrée');
     }
 
-    final valueKey = _topMetric == TopProductsMetric.quantity ? 'total_qty' : 'total_revenue';
+    final valueKey = _topMetric == TopProductsMetric.quantity ? 'total_qty' : 'total_profit';
     final maxValue = rows.map((p) => (p[valueKey] as num?)?.toDouble() ?? 0).fold<double>(0, (a, b) => a > b ? a : b);
 
     return Container(
@@ -495,7 +500,7 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
       return const _EmptyChartBox(text: 'Aucune donnée par catégorie');
     }
     final colors = [AppColors.gold, AppColors.black, AppColors.goldLight, AppColors.grey];
-    final total = _byCategory.fold<double>(0, (s, c) => s + ((c['revenue'] as num?)?.toDouble() ?? 0));
+    final total = _byCategory.fold<double>(0, (s, c) => s + ((c['profit'] as num?)?.toDouble() ?? 0).clamp(0, double.infinity).toDouble());
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -510,10 +515,12 @@ class _AnalyseScreenState extends State<AnalyseScreen> {
                 sectionsSpace: 2,
                 centerSpaceRadius: 36,
                 sections: List.generate(_byCategory.length, (i) {
-                  final rev = (_byCategory[i]['revenue'] as num?)?.toDouble() ?? 0;
-                  final pct = total == 0 ? 0 : (rev / total * 100);
+                  // Clamped at 0: a pie slice can't represent a category
+                  // that lost money overall — it just won't show a slice.
+                  final profit = ((_byCategory[i]['profit'] as num?)?.toDouble() ?? 0).clamp(0, double.infinity).toDouble();
+                  final pct = total == 0 ? 0 : (profit / total * 100);
                   return PieChartSectionData(
-                    value: rev,
+                    value: profit,
                     color: colors[i % colors.length],
                     title: '${pct.toStringAsFixed(0)}%',
                     radius: 40,
