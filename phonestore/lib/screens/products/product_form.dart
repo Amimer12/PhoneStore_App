@@ -60,6 +60,11 @@ class _ProductFormState extends State<ProductForm> {
   bool _loading = true;
   bool _saving = false;
 
+  /// True when we loaded an existing product whose prix_achat was null —
+  /// we silently default it to 0 in the field, but still warn the user once
+  /// so they know to fill in the real cost price.
+  bool _prixAchatWasMissing = false;
+
   bool get _isEdit => widget.product != null;
 
   CategoryMode get _categoryMode {
@@ -126,7 +131,10 @@ class _ProductFormState extends State<ProductForm> {
       _referenceCtrl.text = p.reference;
       _nameCtrl.text = p.name ?? '';
       _prixCtrl.text = p.prix?.toString() ?? '';
-      _prixAchatCtrl.text = p.prixAchat?.toString() ?? '';
+      _prixAchatWasMissing = p.prixAchat == null;
+      // prix_achat must never be null going forward — default a missing
+      // value to 0 in the form (see [_prixAchatWasMissing] for the warning).
+      _prixAchatCtrl.text = (p.prixAchat ?? 0).toString();
       _stockCtrl.text = p.stock == null ? '' : (p.stock! % 1 == 0 ? p.stock!.toInt().toString() : p.stock!.toString());
       _existingImageUrl = p.imageUrl;
       _categoryId = p.categoryId;
@@ -142,6 +150,21 @@ class _ProductFormState extends State<ProductForm> {
       }
     }
     setState(() => _loading = false);
+    if (_prixAchatWasMissing) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              "Ce produit n'avait pas de prix d'achat renseigné — il a été mis à 0 par défaut. "
+              "Pensez à le mettre à jour ci-dessous.",
+            ),
+            backgroundColor: AppColors.danger,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      });
+    }
   }
 
   Future<void> _onCategoryChanged(int? id) async {
@@ -444,10 +467,12 @@ class _ProductFormState extends State<ProductForm> {
     return double.tryParse(text) ?? (_categoryMode == CategoryMode.simple ? null : 0);
   }
 
-  int? _parsePrixAchat() {
+  /// prix_achat is now always saved as a number — never null. An empty or
+  /// invalid field defaults to 0 rather than leaving the cost price unset.
+  int _parsePrixAchat() {
     final text = _prixAchatCtrl.text.trim();
-    if (text.isEmpty) return null;
-    return int.tryParse(text);
+    if (text.isEmpty) return 0;
+    return int.tryParse(text) ?? 0;
   }
 
   // ---------------- save ----------------
@@ -621,9 +646,10 @@ class _ProductFormState extends State<ProductForm> {
             const Text('Catégorie *', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
             const SizedBox(height: 8),
             CategoryIconPicker(
-              // 'repair' categories never have products — everything is
-              // chosen as a type combo directly in the Achats form.
-              categories: _categories.where((c) => c.mode != CategoryMode.repair).toList(),
+              // 'repair' categories now support real products too (e.g. an
+              // "Afficheur Galaxy S20" part), same as hierarchical ones —
+              // just with no type2/sous-type level (see _showType2 below).
+              categories: _categories,
               selectedId: _categoryId,
               onSelect: _onCategoryChanged,
               onAddNew: _quickAddCategory,
@@ -701,15 +727,21 @@ class _ProductFormState extends State<ProductForm> {
             TextFormField(
               controller: _prixAchatCtrl,
               decoration: const InputDecoration(
-                labelText: "Prix d'achat (DA, optionnel)",
+                labelText: "Prix d'achat (DA) *",
               ),
               keyboardType: TextInputType.number,
               validator: (v) => (v != null && v.trim().isNotEmpty && int.tryParse(v.trim()) == null) ? 'Prix invalide' : null,
             ),
             const SizedBox(height: 8),
-            const Text(
-              "Ce que vous avez payé pour ce produit — sert à calculer le bénéfice net dans l'Analyse. Laissez vide si inconnu.",
-              style: TextStyle(color: AppColors.grey, fontSize: 12),
+            Text(
+              _prixAchatWasMissing
+                  ? "Ce que vous avez payé pour ce produit — non renseigné auparavant, mis à 0 par défaut. Mettez-le à jour."
+                  : "Ce que vous avez payé pour ce produit — sert à calculer le bénéfice net dans l'Analyse et à vous avertir si vous vendez à perte.",
+              style: TextStyle(
+                color: _prixAchatWasMissing ? AppColors.danger : AppColors.grey,
+                fontSize: 12,
+                fontWeight: _prixAchatWasMissing ? FontWeight.w600 : FontWeight.normal,
+              ),
             ),
             const SizedBox(height: 24),
             SizedBox(

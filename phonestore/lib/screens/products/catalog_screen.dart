@@ -531,8 +531,8 @@ class _TypesTabState extends State<_TypesTab> {
             child: Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                'Catégorie réparation — un seul niveau de type, pas de produits à créer. '
-                'À la vente, plusieurs types se combinent sur une même ligne avec un prix total libre.',
+                'Catégorie réparation — un seul niveau de type (ex: Afficheur, Flash, Connecteur), pas de sous-types. '
+                'Créez les pièces (produits) depuis l\'écran Produits, comme pour les autres catégories.',
                 style: TextStyle(color: AppColors.grey, fontSize: 12),
               ),
             ),
@@ -801,7 +801,7 @@ String _modeLabel(CategoryMode m) {
     case CategoryMode.perfume:
       return 'Parfum — nom + taille';
     case CategoryMode.repair:
-      return 'Réparation — combo de types, prix total libre';
+      return 'Réparation — un seul niveau de type, produits comme les autres catégories';
     case CategoryMode.hierarchical:
       return 'Hiérarchique — type + sous-type';
   }
@@ -851,7 +851,7 @@ class _CategoryModeSelector extends StatelessWidget {
         option(CategoryMode.hierarchical, 'Hiérarchique', 'Type + sous-type, prix fixe par produit'),
         option(CategoryMode.simple, 'Simple', 'Un seul type, prix libre saisi à la vente'),
         option(CategoryMode.perfume, 'Parfum', 'Nom du parfum + taille, prix fixe par taille'),
-        option(CategoryMode.repair, 'Réparation', 'Combo de types (ex: Afficheur + Flash), pas de produits, prix total libre'),
+        option(CategoryMode.repair, 'Réparation', 'Un seul niveau de type (ex: Afficheur, Flash) — produits comme une catégorie hiérarchique simplifiée'),
       ],
     );
   }

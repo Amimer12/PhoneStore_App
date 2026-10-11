@@ -1,78 +1,58 @@
 // _shared/drive.ts
 //
 // Minimal Google Drive v3 client for the monthly-archive function: just
-// enough to authenticate as a service account, find-or-create a "<year>"
-// subfolder inside a fixed root folder, and upload one .xlsx file into it.
+// enough to authenticate as YOU (via a stored OAuth refresh token — see
+// below), find-or-create a "<year>" subfolder inside a fixed root folder,
+// and upload one .xlsx file into it.
+//
+// Why not a service account: a plain (non-Workspace) service account has
+// ZERO Drive storage quota of its own — Google attributes any file it
+// creates to the service account itself, which has 0 bytes to give, so
+// every upload fails with "storageQuotaExceeded". Workspace's "Shared
+// Drives" fix this (pooled org storage), but a personal Gmail account
+// doesn't have that. Authenticating as your own real account sidesteps
+// the problem entirely: the file is created by you, in your own storage,
+// same as if you'd dragged it into Drive by hand.
 //
 // Setup (one-time, outside this code):
-//   1. Google Cloud Console → create a project (or reuse one) → APIs &
-//      Services → Credentials → Create a Service Account → Keys → Add key
-//      (JSON). Enable the "Google Drive API" for that project.
-//   2. In Google Drive, create the root archive folder (e.g.
-//      "PhoneStore Archives"), open its sharing settings, and share it
-//      with the service account's email (looks like
-//      xxxx@yyyy.iam.gserviceaccount.com) as Editor. The service account
-//      has NO storage of its own — it can only write into folders a real
-//      human has explicitly shared with it.
-//   3. Copy that folder's id from its URL
-//      (drive.google.com/drive/folders/<THIS_PART>).
-//   4. Store two Supabase Edge Function secrets:
-//        supabase secrets set GDRIVE_SERVICE_ACCOUNT_JSON='<paste the whole downloaded JSON>'
+//   1. Google Cloud Console → APIs & Services → Credentials → Create
+//      Credentials → OAuth client ID → Application type: Desktop app.
+//      This gives you a Client ID and Client Secret (no key file this
+//      time — just two short strings).
+//   2. Get a refresh token for your OWN Google account (the one that
+//      owns/can see the archive folder) using Google's OAuth Playground
+//      (https://developers.google.com/oauthplayground):
+//        - Gear icon (top right) → check "Use your own OAuth
+//          credentials" → paste in your Client ID and Client Secret.
+//        - In the scopes list on the left, enter
+//          https://www.googleapis.com/auth/drive.file → Authorize APIs.
+//        - Sign in with your own Google account, approve.
+//        - Click "Exchange authorization code for tokens" → copy the
+//          Refresh token shown. Refresh tokens don't expire on their own
+//          (only if revoked), so this is a one-time step.
+//   3. Create the root archive folder in your own Drive as normal — no
+//      sharing step needed this time, since we're acting as you, not a
+//      separate service-account identity.
+//   4. Store four Supabase Edge Function secrets:
+//        supabase secrets set GDRIVE_OAUTH_CLIENT_ID='<from step 1>'
+//        supabase secrets set GDRIVE_OAUTH_CLIENT_SECRET='<from step 1>'
+//        supabase secrets set GDRIVE_OAUTH_REFRESH_TOKEN='<from step 2>'
 //        supabase secrets set GDRIVE_ARCHIVE_FOLDER_ID='<folder id from step 3>'
+//      (GDRIVE_SERVICE_ACCOUNT_JSON is no longer used — safe to delete.)
 
-interface ServiceAccountKey {
-  client_email: string;
-  private_key: string;
-}
-
-/** Base64url-encode, no padding — what JWT wants. */
-function b64url(bytes: ArrayBuffer | string): string {
-  const raw = typeof bytes === 'string' ? new TextEncoder().encode(bytes) : new Uint8Array(bytes);
-  let str = '';
-  for (const b of raw) str += String.fromCharCode(b);
-  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-async function importPrivateKey(pem: string): Promise<CryptoKey> {
-  const clean = pem
-    .replace(/-----BEGIN PRIVATE KEY-----/, '')
-    .replace(/-----END PRIVATE KEY-----/, '')
-    .replace(/\s+/g, '');
-  const der = Uint8Array.from(atob(clean), (c) => c.charCodeAt(0));
-  return crypto.subtle.importKey(
-    'pkcs8',
-    der.buffer,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-}
-
-/** Exchanges the service-account key for a short-lived Drive-scoped access token (JWT bearer grant, RFC 7523). */
-async function getAccessToken(key: ServiceAccountKey): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const claims = {
-    iss: key.client_email,
-    scope: 'https://www.googleapis.com/auth/drive.file',
-    aud: 'https://oauth2.googleapis.com/token',
-    iat: now,
-    exp: now + 3600,
-  };
-  const unsigned = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(claims))}`;
-  const cryptoKey = await importPrivateKey(key.private_key);
-  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', cryptoKey, new TextEncoder().encode(unsigned));
-  const jwt = `${unsigned}.${b64url(sig)}`;
-
+/** Exchanges the stored refresh token for a short-lived Drive-scoped access token. */
+async function getAccessToken(clientId: string, clientSecret: string, refreshToken: string): Promise<string> {
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt,
+      grant_type: 'refresh_token',
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
     }),
   });
-  if (!res.ok) throw new Error(`Google token exchange failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`Google token refresh failed: ${res.status} ${await res.text()}`);
   const json = await res.json();
   return json.access_token as string;
 }
@@ -157,8 +137,11 @@ async function findFileId(token: string, name: string, parentId: string): Promis
 }
 
 export async function driveAccessToken(): Promise<string> {
-  const raw = Deno.env.get('GDRIVE_SERVICE_ACCOUNT_JSON');
-  if (!raw) throw new Error('Missing GDRIVE_SERVICE_ACCOUNT_JSON secret');
-  const key = JSON.parse(raw) as ServiceAccountKey;
-  return getAccessToken(key);
+  const clientId = Deno.env.get('GDRIVE_OAUTH_CLIENT_ID');
+  const clientSecret = Deno.env.get('GDRIVE_OAUTH_CLIENT_SECRET');
+  const refreshToken = Deno.env.get('GDRIVE_OAUTH_REFRESH_TOKEN');
+  if (!clientId) throw new Error('Missing GDRIVE_OAUTH_CLIENT_ID secret');
+  if (!clientSecret) throw new Error('Missing GDRIVE_OAUTH_CLIENT_SECRET secret');
+  if (!refreshToken) throw new Error('Missing GDRIVE_OAUTH_REFRESH_TOKEN secret');
+  return getAccessToken(clientId, clientSecret, refreshToken);
 }

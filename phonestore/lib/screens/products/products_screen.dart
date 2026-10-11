@@ -414,7 +414,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           CategoryIconPicker(
-            categories: _categories.where((c) => c.mode != CategoryMode.repair).toList(),
+            categories: _categories,
             selectedId: _selectedCategoryId,
             onSelect: _onCategoryChanged,
             allowClear: true,
